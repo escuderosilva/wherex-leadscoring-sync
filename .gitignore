@@ -1,0 +1,19 @@
+# Secretos — NUNCA commitear. En CI los tokens llegan por repository secrets.
+.env
+**/.env
+*.pem
+config.json
+
+# Salida de corridas: se revisa, no se versiona (en CI van como artifact)
+logs/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# macOS / Windows
+.DS_Store
+desktop.ini

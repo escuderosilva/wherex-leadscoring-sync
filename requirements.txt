@@ -1,0 +1,3 @@
+# Única dependencia del sync. Sin pines exactos a propósito: son llamadas HTTP
+# simples y no hay razón para congelar la versión.
+requests>=2.31

@@ -1,0 +1,92 @@
+name: Sync semanal Circle + Brevo → HubSpot
+
+# Corre solo, todas las semanas, sin depender de que ninguna laptop esté prendida.
+#
+# Reemplaza dos jobs de launchd que corrían en el Mac de Emilio y que fallaban en
+# silencio: `com.procure.circle-hubspot-sync` venía muriendo desde el 2026-07-27 con
+# "Operation not permitted" (macOS TCC no deja que launchd lea ~/Downloads sin Full
+# Disk Access), y el de Brevo nunca alcanzó a correr programado.
+#
+# ⚠️ GitHub desactiva los workflows programados de un repo sin actividad por 60 días.
+# Si el repo queda quieto, revisar que el schedule siga habilitado en la pestaña Actions.
+
+on:
+  schedule:
+    # Lunes 11:00 UTC ≈ 07:00 en Chile (UTC-4). GitHub puede atrasar el disparo unos
+    # minutos cuando hay cola; para este sync es irrelevante.
+    - cron: '0 11 * * 1'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Calcular sin escribir en HubSpot'
+        type: boolean
+        default: false
+      limite:
+        description: 'Tope de contactos a escribir (vacío = todos)'
+        type: string
+        default: ''
+
+# Dos corridas en paralelo escribirían las mismas propiedades a la vez. La nueva espera.
+concurrency:
+  group: sync-circle-brevo
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    # El sync hace ~22.500 llamadas a Brevo en paralelo: toma 20-25 min. El techo deja
+    # aire para reintentos por rate limit sin quedarse colgado un día entero.
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Sync Circle + Brevo → HubSpot
+        env:
+          # Los tokens llegan como variables de entorno reales; no hay .env en CI.
+          # `load_env()` usa setdefault, así que estos ganan sobre cualquier archivo.
+          HUBSPOT_TOKEN: ${{ secrets.HUBSPOT_TOKEN }}
+          BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
+          CIRCLE_API_TOKEN: ${{ secrets.CIRCLE_API_TOKEN }}
+        run: |
+          set -o pipefail
+          mkdir -p logs
+          ARGS=""
+          if [ "${{ inputs.dry_run }}" = "true" ]; then ARGS="$ARGS --dry-run"; fi
+          if [ -n "${{ inputs.limite }}" ]; then ARGS="$ARGS --limite ${{ inputs.limite }}"; fi
+          echo "Corriendo: sync_circle_brevo.py $ARGS"
+          python -u sync_circle_brevo.py $ARGS 2>&1 | tee logs/sync.log
+
+      - name: Read-back en HubSpot
+        # Guarda obligatoria: el sync puede terminar "verde" con lotes parcialmente
+        # rechazados. Esto cuenta los contactos directamente en HubSpot en vez de
+        # confiar en el log. Se salta en dry-run porque no se escribió nada.
+        if: ${{ inputs.dry_run != true }}
+        env:
+          HUBSPOT_TOKEN: ${{ secrets.HUBSPOT_TOKEN }}
+          BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
+          CIRCLE_API_TOKEN: ${{ secrets.CIRCLE_API_TOKEN }}
+        run: |
+          set -o pipefail
+          python -u verificar_scoring.py 2>&1 | tee logs/verificacion.log
+
+      - name: Guardar logs
+        # `always()` para que los logs queden disponibles justo cuando la corrida falla,
+        # que es cuando hacen falta.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ github.run_number }}
+          path: logs/
+          retention-days: 30
