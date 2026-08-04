@@ -11,6 +11,7 @@ Uso:
 import argparse
 import os
 import sys
+import time
 
 import requests
 
@@ -50,6 +51,28 @@ CRITICAS_CON_DATOS = [
     "brevo_fecha_desuscripcion",
 ]
 
+# Este read-back gatillaba sobre cuatro señales, TODAS de Brevo. No miraba una sola
+# propiedad de Circle: `es_comunidad` se imprimía pero no gatillaba, y el resto ni se
+# consultaba. Consecuencia concreta: si la fase de Circle se rompía o se salteaba
+# entera, la verificación salía verde igual.
+CIRCLE = [
+    "circle_publicaciones",
+    "circle_comentarios",
+    "circle_activity_score",
+    "circle_nivel",
+    "circle_ultima_visita",
+]
+
+# Un piso de cobertura, no un "> 0". Circle devuelve ~390 miembros y el objeto anidado
+# `activity_score` viene en ~337 de ellos, así que una caída real se ve como un número
+# que se desploma, no como un cero. Con "distinto de cero" un solo contacto sobreviviente
+# haría pasar la prueba.
+PISOS_COBERTURA = {
+    "es_comunidad": 300,
+    "circle_publicaciones": 300,
+    "circle_activity_score": 250,
+}
+
 
 def _headers():
     return {
@@ -59,22 +82,40 @@ def _headers():
 
 
 def total(filtros):
+    """Cuenta contactos con reintento.
+
+    Son ~45 POST /search seguidos. El endpoint de search de HubSpot tiene un límite
+    propio, más bajo que el resto de la API: sin reintento, un 429 acá tumbaba el
+    workflow con un traceback que no se parece en nada a un problema de datos.
+    Mismo patrón que `esquema/hs_client.py` del repo principal: honrar `Retry-After`.
+    """
     body = {
         "filterGroups": [{"filters": filtros}],
         "limit": 1,
         "properties": ["email"],
     }
-    r = requests.post(
-        BASE + "/crm/v3/objects/contacts/search",
-        headers=_headers(),
-        json=body,
-        timeout=45,
-    )
-    if not r.ok:
+    for intento in range(6):
+        try:
+            r = requests.post(
+                BASE + "/crm/v3/objects/contacts/search",
+                headers=_headers(),
+                json=body,
+                timeout=45,
+            )
+        except requests.exceptions.RequestException as e:
+            if intento == 5:
+                raise RuntimeError("HubSpot search, error de red: {}".format(e))
+            time.sleep(min(2 ** intento, 30))
+            continue
+        if r.ok:
+            return r.json().get("total", 0)
+        if r.status_code in (429, 500, 502, 503, 504) and intento < 5:
+            time.sleep(float(r.headers.get("Retry-After", min(2 ** intento, 30))))
+            continue
         raise RuntimeError(
             "HubSpot search -> {}: {}".format(r.status_code, r.text[:400])
         )
-    return r.json().get("total", 0)
+    raise RuntimeError("HubSpot search: sin respuesta tras reintentos")
 
 
 def tiene(propiedad):
@@ -119,6 +160,10 @@ def main():
         con_valor, verdaderos = tiene(prop), igual(prop, "true")
         resultados[prop] = con_valor
         print("{:<38} {:>12,} {:>12,}".format(prop, con_valor, verdaderos))
+    for prop in CIRCLE:
+        con_valor = tiene(prop)
+        resultados[prop] = con_valor
+        print("{:<38} {:>12,} {:>12}".format(prop, con_valor, "-"))
 
     tipo = "brevo_desuscripcion_tipo"
     resultados[tipo] = tiene(tipo)
@@ -129,6 +174,10 @@ def main():
     vacias = [p for p in CRITICAS_CON_DATOS if resultados.get(p, 0) == 0]
     if resultados.get("brevo_nl_aperturas_90d:positivos", 0) == 0:
         vacias.insert(0, "brevo_nl_aperturas_90d (> 0)")
+    for prop, piso in PISOS_COBERTURA.items():
+        cobertura = resultados.get(prop, 0)
+        if cobertura < piso:
+            vacias.append("{} ({:,} < piso {:,})".format(prop, cobertura, piso))
     if vacias and not args.sin_validar:
         print("\nFALLO: señales críticas sin datos: " + ", ".join(vacias))
         return 1

@@ -25,6 +25,14 @@ on:
         description: 'Tope de contactos a escribir (vacío = todos)'
         type: string
         default: ''
+      solo:
+        # La fase de Brevo son ~20 de los ~28 minutos (22.500 llamadas). Cuando solo
+        # hace falta refrescar Circle, `circle` corre en ~2 min y no manda ninguna
+        # propiedad de Brevo (no las manda en None: no las incluye en el payload).
+        description: 'Correr una sola fuente: circle | brevo (vacío = ambas)'
+        type: choice
+        options: ['', 'circle', 'brevo']
+        default: ''
 
 # Dos corridas en paralelo escribirían las mismas propiedades a la vez. La nueva espera.
 concurrency:
@@ -65,6 +73,7 @@ jobs:
           ARGS=""
           if [ "${{ inputs.dry_run }}" = "true" ]; then ARGS="$ARGS --dry-run"; fi
           if [ -n "${{ inputs.limite }}" ]; then ARGS="$ARGS --limite ${{ inputs.limite }}"; fi
+          if [ -n "${{ inputs.solo }}" ]; then ARGS="$ARGS --solo ${{ inputs.solo }}"; fi
           echo "Corriendo: sync_circle_brevo.py $ARGS"
           python -u sync_circle_brevo.py $ARGS 2>&1 | tee logs/sync.log
 

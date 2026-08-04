@@ -688,11 +688,15 @@ def _postear_lote(lote, nivel=0, intento=0):
 
     if r.status_code == 400:
         malos = {m.lower() for m in RE_INVALIDO.findall(r.text)}
-        if malos:
-            quedan = [(e, p) for e, p in lote if e.lower() not in malos]
+        quedan = [(e, p) for e, p in lote if e.lower() not in malos] if malos else lote
+        # Solo recursamos si el reintento va a ser distinto del intento actual. Si
+        # HubSpot nombra un email que no coincide exacto con ninguna clave del lote
+        # (comillas, puntuacion, otra normalizacion), `quedan == lote` y esta rama se
+        # llamaria a si misma con el mismo lote hasta reventar por RecursionError.
+        if malos and len(quedan) < len(lote) and nivel < 8:
             esc, fal, desc = _postear_lote(quedan, nivel + 1, 0)
             return esc, fal + len(lote) - len(quedan), desc + sorted(malos)
-        if len(lote) > 1 and nivel < 8:
+        if not malos and len(lote) > 1 and nivel < 8:
             mitad = len(lote) // 2
             a = _postear_lote(lote[:mitad], nivel + 1, 0)
             b = _postear_lote(lote[mitad:], nivel + 1, 0)
@@ -709,7 +713,12 @@ def escribir(por_email, dry_run=False, limite=None):
     entrada. Aca no se mapea la respuesta, solo se cuenta; si alguna vez hay que
     leerla, mapear por properties[idProperty] y nunca por posicion.
     """
-    items = [(e, p) for e, p in por_email.items() if p]
+    # `if p` solo probaba que el dict no estuviera vacio. Un contacto con todas sus
+    # propiedades en None (p. ej. solo alcanzado por circle_posts() con una fecha que
+    # no parsea) pasaba el filtro y, como el write es batch/upsert por email, CREABA
+    # un contacto pelado en HubSpot con nada mas que el email.
+    items = [(e, p) for e, p in por_email.items()
+             if any(v is not None for v in p.values())]
     descartados_regex = [e for e, _ in items if not RE_EMAIL.match(e)]
     if descartados_regex:
         items = [(e, p) for e, p in items if RE_EMAIL.match(e)]
@@ -737,7 +746,15 @@ def escribir(por_email, dry_run=False, limite=None):
     if rechazados:
         print(f"  emails rechazados por HubSpot ({len(rechazados)}): "
               f"{rechazados[:10]}{' ...' if len(rechazados) > 10 else ''}", file=sys.stderr)
+    # `rechazados` = emails que HubSpot nombro como invalidos en el cuerpo del 400.
+    # `inexplicados` = fallidos que nadie explico: lote caido por token vencido, rate
+    # limit agotado, 500. Esa es la unica cifra que debe tumbar la corrida (ver main).
+    inexplicados = max(0, fallidos - len(rechazados))
+    if inexplicados:
+        print(f"  ⚠ {inexplicados} fallidos SIN explicacion de HubSpot", file=sys.stderr)
     return {"escritos": escritos, "fallidos": fallidos,
+            "inexplicados": inexplicados,
+            "rechazados_hubspot": rechazados,
             "rechazados": rechazados + descartados_regex}
 
 
@@ -764,8 +781,29 @@ def main():
         for email, props in brevo_todo().items():
             datos.setdefault(email, {}).update(props)
     resultado = escribir(datos, dry_run=a.dry_run, limite=a.limite)
-    if resultado.get("fallidos"):
+
+    # Fallar SOLO por fallos que HubSpot no explico.
+    #
+    # Antes esto era `if resultado.get("fallidos")`, un test de verdad sobre un entero:
+    # 22.541 escritos de 22.563 salia rojo igual que 0 escritos. Y los 22 fallidos son
+    # emails con TLD malformado heredados de Salesforce (.ocm/.con/.c/.cpm/.ccom) que
+    # HubSpot rechaza contra su propia lista: son los MISMOS 22 corrida tras corrida y
+    # no hay reintento que los vuelva validos. O sea, el job salia rojo todas las
+    # semanas por una razon que no cambia nunca.
+    #
+    # El costo real de eso no era el color: el paso de read-back del workflow lleva un
+    # `success()` implicito, asi que verificar_scoring.py NUNCA corria. La unica guarda
+    # del frente estaba desactivada por un fallo benigno y permanente.
+    #
+    # No se usa una allowlist de los 22 porque seria exacta hoy y quedaria vieja sin
+    # que nadie la actualice. Esto usa datos que escribir() ya devuelve.
+    if resultado.get("inexplicados"):
         raise SystemExit(1)
+    if resultado.get("rechazados_hubspot"):
+        print(f"\nOK con reparos: {len(resultado['rechazados_hubspot'])} contactos no se "
+              f"pudieron escribir por email invalido en el origen (Brevo/Circle). "
+              f"Se corrigen alla o se aceptan; no son un fallo de este sync.",
+              file=sys.stderr)
 
 
 if __name__ == "__main__":
