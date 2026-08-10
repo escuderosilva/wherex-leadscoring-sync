@@ -12,9 +12,14 @@ name: Sync semanal Circle + Brevo → HubSpot
 
 on:
   schedule:
-    # Lunes 11:00 UTC ≈ 07:00 en Chile (UTC-4). GitHub puede atrasar el disparo unos
+    # Miercoles 11:00 UTC ≈ 07:00 en Chile (UTC-4). GitHub puede atrasar el disparo unos
     # minutos cuando hay cola; para este sync es irrelevante.
-    - cron: '0 11 * * 1'
+    #
+    # Por que miercoles y no lunes: el newsletter sale los MARTES. Con el cron en lunes
+    # el sync corria el dia antes del envio, asi que las aperturas y clics de cada
+    # campana esperaban 7 dias enteros para llegar a HubSpot. Miercoles las recoge ~24 h
+    # despues del envio, que es donde ya cayo el grueso de la apertura.
+    - cron: '0 11 * * 3'
   workflow_dispatch:
     inputs:
       dry_run:

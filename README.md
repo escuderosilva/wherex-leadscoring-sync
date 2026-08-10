@@ -3,12 +3,12 @@
 Sync **semanal** que alimenta el lead scoring **nativo** de HubSpot con señales de la
 comunidad (Circle) y del email marketing (Brevo).
 
-Corre solo en **GitHub Actions**, los lunes. No depende de que ninguna laptop esté prendida.
+Corre solo en **GitHub Actions**, los miércoles. No depende de que ninguna laptop esté prendida.
 
 | | |
 |---|---|
 | **Qué escribe** | 25 propiedades de Contacto en HubSpot (`circle_*` y `brevo_*`) |
-| **Cuándo** | lunes 11:00 UTC (≈ 07:00 Chile) · `.github/workflows/sync-semanal.yml` |
+| **Cuándo** | miércoles 11:00 UTC (≈ 07:00 Chile) · `.github/workflows/sync-semanal.yml`. El newsletter sale los **martes**: el sync lo recoge ~24 h después del envío. |
 | **Cuánto tarda** | 20-25 min (~22.500 llamadas a Brevo en paralelo) |
 | **Portal HubSpot** | 51404466 (producción) |
 
@@ -68,6 +68,30 @@ En local salen de un `.env` junto al script (está en `.gitignore`). `load_env()
 `setdefault`, así que **una variable ya presente en el entorno gana sobre el archivo**: en
 CI manda el secret, en local manda tu `.env`. Si falta alguno, el script falla en la primera
 línea con un mensaje claro en vez de morir con un `KeyError` a los 20 minutos.
+
+## `actividades_mkt.csv`: la columna `categoria` es un contrato, no una anotación
+
+El CSV que cura marketing dice, por cada lista de Brevo, **qué es**. `brevo_actividades()`
+la consume así:
+
+| `categoria` | Qué hace el sync |
+|---|---|
+| `academica` | cuenta según `tipo` (registro / asistencia / certificado) y, si `paga`, suma a `academico_asistencias_pagas_12m` |
+| `evento_wherex` | suma `eventos_wherex_12m` |
+| `evento_pl` | **se saltea**: desde 2026-07-30 sale del RSVP real de Circle, no de la audiencia de invitación |
+| `ignorar` | **se saltea**: son segmentos de prospección y audiencias de campaña, no actividades |
+
+⚠️ **Si agregas una categoría al generador, tienes que consumirla acá.** Hasta el
+2026-08-10 `ignorar` se escribía y no se leía: las 44 listas marcadas así caían al `else`
+final y cada una sumaba `academico_registros_12m`. Medido ese día contra Brevo: las listas
+académicas de verdad son **6.758** emails distintos y las de `ignorar` **18.540** (15.602
+jamás estuvieron en una académica), con la propiedad poblada en **16.664** contactos de
+HubSpot. Estar en "Prospectos Fit - México" contaba como haberse registrado a una actividad
+académica, y el scoring nativo puntuaba sobre eso.
+
+**El arreglo no limpia lo ya escrito** — ver "Un `None` se omite" acá abajo: este sync no
+vacía propiedades. Los ~10.000 contactos que quedaron con un valor inflado necesitan un
+backfill de una vez, que vive en `hubspot_admin/leadscoring/`.
 
 ## Dos decisiones de diseño que conviene no revertir sin pensarlo
 

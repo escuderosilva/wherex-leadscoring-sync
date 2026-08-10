@@ -506,6 +506,21 @@ def brevo_actividades(mapa_path="actividades_mkt.csv"):
             # exacta). Estas listas de Brevo son audiencias de invitacion, no
             # asistencia por evento -> no sumar dos veces.
             continue
+        if act["categoria"] == "ignorar":
+            # `ignorar` es la categoria que marketing le pone a las listas que NO son
+            # actividades: segmentos de prospeccion, audiencias de campana, "no
+            # abiertos". Hasta el 2026-08-10 este `continue` no existia y esas listas
+            # caian al `else` de abajo -> cada una sumaba `academico_registros_12m` y
+            # pisaba `academico_ultima_actividad`. Medido contra Brevo ese dia: las
+            # listas academicas de verdad son 6.758 emails distintos, las de `ignorar`
+            # 18.540 (15.602 de ellos jamas estuvieron en una academica), y la
+            # propiedad estaba poblada en 16.664 contactos de HubSpot. O sea: estar en
+            # "Prospectos Fit - Mexico" contaba como haberse registrado a una actividad
+            # academica, y el scoring puntuaba sobre eso.
+            #
+            # La categoria se ESCRIBE en generar_mapeo() y hasta hoy no la leia nadie:
+            # si agregas una categoria nueva al generador, acordate de consumirla aca.
+            continue
         offset = 0
         while offset < 100_000:
             r = _get(f"{BREVO}/contacts/lists/{act['list_id']}/contacts", _h_brevo(),
@@ -521,12 +536,27 @@ def brevo_actividades(mapa_path="actividades_mkt.csv"):
                     out[email]["eventos_wherex_12m"] += 1
                 elif act["tipo"] == "asistencia":
                     out[email]["academico_asistencias_12m"] += 1
-                    if act["paga"]:
-                        out[email]["academico_asistencias_pagas_12m"] += 1
                 elif act["tipo"] == "certificado":
                     out[email]["academico_certificados"] += 1
                 else:
                     out[email]["academico_registros_12m"] += 1
+                # `paga` se lee en CUALQUIER actividad academica, no solo en las de
+                # tipo "asistencia". Antes estaba adentro de esa rama y las dos unicas
+                # listas pagas que marketing marco ("Inscritos Tally IPADE" 72,
+                # "Inscritos IPADE 24/06" 289) son tipo=registro -> la propiedad estaba
+                # en 0 para TODO el portal y el criterio de +20, el mas alto de su
+                # grupo, no disparaba para nadie. No se arregla marcando mas filas: no
+                # existe ninguna lista de asistencia paga en Brevo.
+                #
+                # Es la opcion (b) de MAPEO_PROPIEDADES.md: una sola propiedad que
+                # cuenta "actividad academica paga (registro o asistencia)". Redefinir
+                # una propiedad en su lugar suele ser un pecado -- es el mismo patron
+                # que el sync viejo de Brevo (totales de por vida vs ventana de 365 d,
+                # sin diff visible) -- pero aca es seguro porque la propiedad vale 0 en
+                # los 141.274 contactos: no hay historia que corromper. El label en el
+                # portal y el inventario se actualizaron en la misma tanda.
+                if act["paga"] and act["categoria"] == "academica":
+                    out[email]["academico_asistencias_pagas_12m"] += 1
                 if not ultima.get(email) or act["fecha"] > ultima[email]:
                     ultima[email] = act["fecha"]
             offset += 500
