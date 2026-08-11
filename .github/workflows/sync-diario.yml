@@ -1,0 +1,155 @@
+name: Sync diario Circle → HubSpot
+
+# Circle, todos los días. ~40 segundos.
+#
+# Por qué Circle va separado de Brevo: la fase de Brevo son ~22.500 llamadas y 20-25
+# minutos porque pide estadísticas contacto por contacto. Circle son ~400 miembros y
+# tarda menos de un minuto. Correr Brevo a diario no aportaría nada — el newsletter
+# sale una vez por semana, los martes — y correr Circle una vez por semana deja la
+# actividad de la comunidad hasta 7 días vieja para el scoring.
+#
+# Un cron DIARIO además es más confiable que uno semanal, no menos: si un día no
+# dispara, al día siguiente se repara solo. Cuando se salta el semanal, son 14 días
+# de datos congelados. El sync es idempotente (recalcula desde el origen y hace
+# upsert por email), así que repetirlo no cuesta nada.
+
+on:
+  schedule:
+    # 10:17 UTC ≈ 06:17 en Chile (UTC-4).
+    #
+    # El minuto 17 no es capricho. Las dos únicas corridas programadas con `0 11`
+    # dispararon 6 h 28 min tarde (2026-08-03, a las 17:28 UTC) y 3 h 40 min tarde
+    # (2026-08-10, a las 14:40 UTC). El minuto 0 de una hora en punto es el slot más
+    # congestionado del scheduler compartido de GitHub. Un minuto impar reduce la
+    # cola, pero NO la elimina: no hay que construir nada que dependa de la hora
+    # exacta. Para eso está el dead-man's switch, con holgura de horas.
+    - cron: '17 10 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Calcular sin escribir en HubSpot'
+        type: boolean
+        default: false
+
+# Mismo grupo que `sync-semanal.yml`: los grupos de concurrency son del REPO, no del
+# workflow, así que esto serializa el diario contra el semanal. Sin esto, un miércoles
+# el diario de Circle y el semanal de Brevo podrían escribir el mismo contacto a la
+# vez. Hoy no se solapan por horario (10:17 vs 11:23) pero el semanal dura 30 min y
+# GitHub atrasa los disparos: el solapamiento es cuestión de tiempo, no hipotético.
+concurrency:
+  group: sync-circle-brevo
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    # 10, no 60. Circle corre en ~40 s: si pasa de 10 minutos algo está colgado y
+    # quiero saberlo hoy, no dentro de una hora.
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Sync Circle → HubSpot
+        env:
+          # Los tokens llegan como variables de entorno reales; no hay .env en CI.
+          # `load_env()` usa setdefault, así que estos ganan sobre cualquier archivo.
+          HUBSPOT_TOKEN: ${{ secrets.HUBSPOT_TOKEN }}
+          BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
+          CIRCLE_API_TOKEN: ${{ secrets.CIRCLE_API_TOKEN }}
+        run: |
+          set -o pipefail
+          mkdir -p logs
+          ARGS="--solo circle"
+          if [ "${{ inputs.dry_run }}" = "true" ]; then ARGS="$ARGS --dry-run"; fi
+          echo "Corriendo: sync_circle_brevo.py $ARGS"
+          python -u sync_circle_brevo.py $ARGS 2>&1 | tee logs/sync.log
+
+      - name: Read-back en HubSpot (sólo Circle)
+        # `--solo circle` a propósito: este job no tocó una sola propiedad de Brevo,
+        # así que no puede fallar por una. Una alerta que se pone roja por algo que el
+        # job no controla es una alerta que se aprende a ignorar — y a 365 corridas por
+        # año eso pasa rápido.
+        if: ${{ inputs.dry_run != true }}
+        env:
+          HUBSPOT_TOKEN: ${{ secrets.HUBSPOT_TOKEN }}
+          BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
+          CIRCLE_API_TOKEN: ${{ secrets.CIRCLE_API_TOKEN }}
+        run: |
+          set -o pipefail
+          python -u verificar_scoring.py --solo circle 2>&1 | tee logs/verificacion.log
+
+      - name: Resumen en la corrida
+        # Con 30 corridas al mes, poder leer los conteos desde la lista de Actions sin
+        # descargar un artifact es la diferencia entre revisar y no revisar.
+        if: always()
+        run: |
+          {
+            echo "## Sync diario de Circle"
+            echo ""
+            echo '```'
+            tail -n 25 logs/sync.log 2>/dev/null || echo "(sin log de sync)"
+            echo '```'
+            echo ""
+            echo "### Read-back"
+            echo '```'
+            tail -n 20 logs/verificacion.log 2>/dev/null || echo "(no corrió)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Latido (dead-man's switch)
+        # LA pieza que faltaba. Ninguna alerta dentro de GitHub Actions puede avisarte
+        # que GitHub NO corrió — y ése es justo el modo de falla que este frente ya
+        # sufrió tres veces: launchd muriendo por TCC, el cron atrasándose horas, y los
+        # workflows programados que GitHub desactiva tras 60 días sin commits.
+        #
+        # El vigilante tiene que vivir FUERA del sistema vigilado. Acá sólo se manda el
+        # ping; si no llega, el servicio externo avisa. Configurar en Healthchecks.io
+        # con period=1 day y grace=6 hours (la holgura cubre los atrasos del scheduler).
+        #
+        # Sin el secret configurado el paso no falla: avisa y sigue. Así el workflow
+        # queda operativo desde el primer día y el switch se enchufa cuando exista.
+        if: success()
+        env:
+          URL: ${{ secrets.HEARTBEAT_DIARIO_URL }}
+        run: |
+          if [ -z "$URL" ]; then
+            echo "::warning::HEARTBEAT_DIARIO_URL no está configurado — este sync NO tiene dead-man's switch. Nadie se va a enterar si el cron deja de disparar."
+            exit 0
+          fi
+          curl -fsS -m 10 --retry 3 "$URL" > /dev/null && echo "Latido enviado."
+
+      - name: Avisar a Slack si falló
+        # GitHub sólo le manda mail a quien tocó por última vez el archivo del cron.
+        # Para un job diario el aviso tiene que llegar donde alguien lo lea.
+        if: failure()
+        env:
+          WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -z "$WEBHOOK" ]; then
+            echo "::warning::SLACK_WEBHOOK_URL no está configurado — la falla sólo se avisa por mail."
+            exit 0
+          fi
+          RUN="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          printf '{"text":"🔴 Sync diario Circle → HubSpot FALLÓ. Revisar: %s"}' "$RUN" \
+            | curl -fsS -m 10 -X POST -H 'Content-Type: application/json' -d @- "$WEBHOOK" > /dev/null
+          echo "Aviso enviado a Slack."
+
+      - name: Guardar logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: logs-diario-${{ github.run_number }}
+          path: logs/
+          retention-days: 30

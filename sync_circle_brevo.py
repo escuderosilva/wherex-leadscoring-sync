@@ -1,4 +1,11 @@
-"""Sync semanal Circle + Brevo -> propiedades de Contacto en HubSpot.
+"""Sync Circle + Brevo -> propiedades de Contacto en HubSpot.
+
+Programacion (ver README y los workflows): **Circle corre TODOS LOS DIAS**
+(`sync-diario.yml`, `--solo circle`, ~40 s) y **Brevo los miercoles**
+(`sync-semanal.yml`, `--solo brevo`, 20-25 min). Se separaron el 2026-08-11: la fase de
+Brevo son ~22.500 llamadas y el newsletter es semanal, asi que a diario no aportaria
+nada; Circle son ~400 miembros y en semanal dejaba la actividad de la comunidad hasta
+7 dias vieja para el scoring.
 
 Alimenta el LEAD SCORING NATIVO de HubSpot. Division de trabajo:
   - este script escribe FECHAS y NUMEROS crudos;
@@ -120,6 +127,23 @@ ESPACIO_PRESENTACION = "presentate"
 # evento_pl. Ver circle_eventos().
 EVENTO_EXCLUIR_PATRON = re.compile(r"prueba", re.IGNORECASE)
 
+# Piso de cordura del ORIGEN (2026-08-11, al pasar Circle a diario).
+#
+# Circle devuelve ~390 miembros. Si una corrida lee muchos menos, la causa mas
+# probable no es que la comunidad se vacio: es que la API fallo de una forma que
+# `_get` NO ve como error -- un token revocado que responde 200 con `records`
+# vacio, una paginacion que corta en la primera pagina, un cambio de contrato.
+#
+# Sin este piso ese fallo escribe 0 contactos, termina en VERDE, y
+# `verificar_scoring.py` tambien pasa: sus pisos de cobertura cuentan lo que
+# HubSpot ya tenia de ayer, no lo que esta corrida escribio. En un job semanal eso
+# cuesta una semana de datos viejos; en uno DIARIO son 90 dias de verde sobre datos
+# congelados sin que nadie se entere.
+#
+# Es la guarda de latencia CERO: corta en la misma corrida, antes de escribir. El
+# detector de frescura de `verificar_scoring.py` es el complemento lento.
+MIN_MIEMBROS_CIRCLE = 300
+
 
 # --------------------------------------------------------------------------- utils
 def _h_hs():
@@ -212,6 +236,13 @@ def circle_miembros():
         if not d.get("has_next_page"):
             break
         page += 1
+    if len(out) < MIN_MIEMBROS_CIRCLE:
+        raise RuntimeError(
+            f"Circle devolvio {len(out)} miembros con email, bajo el piso "
+            f"{MIN_MIEMBROS_CIRCLE}. No se escribe nada. Es mucho mas probable un "
+            f"fallo de la API o del token que una caida real de la comunidad; si la "
+            f"comunidad de verdad bajo de ese numero, ajusta MIN_MIEMBROS_CIRCLE."
+        )
     return out
 
 

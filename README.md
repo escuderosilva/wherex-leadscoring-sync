@@ -1,16 +1,55 @@
 # Sync Circle + Brevo → HubSpot (lead scoring de marketing)
 
-Sync **semanal** que alimenta el lead scoring **nativo** de HubSpot con señales de la
-comunidad (Circle) y del email marketing (Brevo).
+Alimenta el lead scoring **nativo** de HubSpot con señales de la comunidad (Circle) y
+del email marketing (Brevo).
 
-Corre solo en **GitHub Actions**, los miércoles. No depende de que ninguna laptop esté prendida.
+Corre solo en **GitHub Actions**. No depende de que ninguna laptop esté prendida.
 
 | | |
 |---|---|
 | **Qué escribe** | 25 propiedades de Contacto en HubSpot (`circle_*` y `brevo_*`) |
-| **Cuándo** | miércoles 11:00 UTC (≈ 07:00 Chile) · `.github/workflows/sync-semanal.yml`. El newsletter sale los **martes**: el sync lo recoge ~24 h después del envío. |
-| **Cuánto tarda** | 20-25 min (~22.500 llamadas a Brevo en paralelo) |
+| **Circle** | **todos los días**, 10:17 UTC (≈ 06:17 Chile) · `.github/workflows/sync-diario.yml` · ~40 s |
+| **Brevo** | **miércoles** 11:23 UTC (≈ 07:23 Chile) · `.github/workflows/sync-semanal.yml` · 20-25 min. El newsletter sale los **martes**: lo recoge ~24 h después del envío. |
 | **Portal HubSpot** | 51404466 (producción) |
+
+## Por qué Circle va a diario y Brevo no
+
+La fase de Brevo son ~22.500 llamadas y 20-25 minutos, porque pide estadísticas
+contacto por contacto. Circle son ~400 miembros y corre en menos de un minuto. Correr
+Brevo a diario no aportaría nada — el newsletter es semanal — y correr Circle una vez
+por semana deja la actividad de la comunidad hasta 7 días vieja para el scoring.
+
+Un cron diario además es **más** confiable que uno semanal: si un día no dispara, al
+día siguiente se repara solo; cuando se salta el semanal son 14 días de datos
+congelados. El sync es idempotente, así que repetirlo no cuesta nada.
+
+Los dos workflows comparten `concurrency: group: sync-circle-brevo`. Los grupos de
+concurrency son del **repo**, no del workflow, así que eso serializa el diario contra
+el semanal: nunca escriben el mismo contacto a la vez.
+
+## Las tres guardas, y qué modo de falla cubre cada una
+
+Este frente ya falló en silencio de tres formas distintas (launchd muriendo por TCC,
+un read-back que nunca corría, 44 listas de Brevo contadas como actividad académica).
+El patrón común no fue el error: fue que **nadie se enteró**. Cada guarda cubre un
+modo distinto y ninguna reemplaza a otra.
+
+| Guarda | Qué detecta | Latencia | Dónde |
+|---|---|---|---|
+| `MIN_MIEMBROS_CIRCLE = 300` | La API de Circle responde 200 con lista vacía (token revocado, cambio de contrato). Sin esto el sync escribe 0 contactos y sale **verde**. | Cero: corta antes de escribir | `sync_circle_brevo.py` |
+| `FRESCURA_DIAS/MIN` | Datos **congelados**: los valores de ayer siguen en HubSpot, así que los pisos de cobertura pasan para siempre. Cuenta visitas a Circle en los últimos 7 días. | Días | `verificar_scoring.py` |
+| Dead-man's switch | Que el cron **no corrió**. Ninguna alerta dentro de GitHub Actions puede avisar de esto. | Horas | `HEARTBEAT_*_URL` |
+
+Los pisos de cobertura (`PISOS_COBERTURA`) prueban que una propiedad **tiene** datos,
+no que sean de hoy. Ésa es la razón de existir del detector de frescura.
+
+## El read-back va con el mismo alcance que el sync
+
+`verificar_scoring.py --solo circle` existe para que el job diario **no pueda fallar
+por una señal de Brevo que no tocó**. A 365 corridas por año, una alerta que se pone
+roja por algo que el job no controla se aprende a ignorar en una semana — es el mismo
+error que tuvo este repo hasta el 2026-08-04, cuando el job salía rojo todos los
+miércoles por 22 emails con TLD malformado y eso mantenía el read-back desactivado.
 
 ## División de trabajo (importante)
 
@@ -45,10 +84,20 @@ pip install -r requirements.txt
 
 # los tokens salen de un .env junto al script, o del entorno
 python3 sync_circle_brevo.py --dry-run              # calcula y muestra, no escribe
-python3 sync_circle_brevo.py --solo circle          # una sola fuente (rápido)
+python3 sync_circle_brevo.py --solo circle          # una sola fuente (~10 s)
 python3 sync_circle_brevo.py --limite 50            # smoke test acotado
 python3 sync_circle_brevo.py                        # completo, escribe
-python3 verificar_scoring.py                        # read-back contra HubSpot
+python3 verificar_scoring.py                        # read-back de las dos fuentes
+python3 verificar_scoring.py --solo circle          # read-back de Circle (8 searches)
+```
+
+En la nube, a demanda, sin clonar nada:
+
+```bash
+gh workflow run sync-diario.yml                     # Circle ahora
+gh workflow run sync-semanal.yml                    # Brevo ahora
+gh workflow run sync-semanal.yml -f solo=ambas      # las dos fuentes en una pasada
+gh workflow run sync-diario.yml -f dry_run=true     # calcula sin escribir
 ```
 
 Es **idempotente**: recalcula desde la fuente y hace upsert por email. Correrlo dos veces
@@ -56,13 +105,25 @@ seguidas deja el mismo estado.
 
 ## Secretos
 
-Tres, y ninguno vive en el repo:
+Ninguno vive en el repo:
 
-| Variable | Dónde |
-|---|---|
-| `HUBSPOT_TOKEN` | GitHub → Settings → Secrets and variables → Actions |
-| `BREVO_API_KEY` | ídem |
-| `CIRCLE_API_TOKEN` | ídem |
+| Variable | Obligatorio | Dónde |
+|---|---|---|
+| `HUBSPOT_TOKEN` | sí | GitHub → Settings → Secrets and variables → Actions |
+| `BREVO_API_KEY` | sí | ídem |
+| `CIRCLE_API_TOKEN` | sí | ídem |
+| `HEARTBEAT_DIARIO_URL` | recomendado | URL de ping de Healthchecks.io (`period 1 day`, `grace 6 hours`) |
+| `HEARTBEAT_SEMANAL_URL` | recomendado | ídem (`period 7 days`, `grace 12 hours`) |
+| `SLACK_WEBHOOK_URL` | recomendado | Webhook entrante de Slack para el aviso de falla |
+
+Los tres opcionales **no rompen nada si faltan**: el paso avisa con un `::warning::` y
+sigue. Pero sin `HEARTBEAT_DIARIO_URL` este sync no tiene dead-man's switch, y ése es
+el único mecanismo capaz de detectar que el cron dejó de disparar.
+
+⚠️ Al rotar un token, actualizar el secret **en la misma tanda**. Orden correcto:
+rotar → `gh secret set` → `gh workflow run sync-diario.yml` para verificar en vivo →
+recién ahí revocar el viejo. Si se rota sin actualizar el secret, el job muere mañana a
+las 06:17 y el aviso va a un mail que nadie mira.
 
 En local salen de un `.env` junto al script (está en `.gitignore`). `load_env()` usa
 `setdefault`, así que **una variable ya presente en el entorno gana sobre el archivo**: en
@@ -99,8 +160,9 @@ backfill de una vez, que vive en `hubspot_admin/leadscoring/`.
 
 En HubSpot un string vacío **borra** la propiedad. La versión anterior mandaba
 `"" if v is None else str(v)`, así que cualquier métrica que la fuente no devolviera se
-limpiaba. En un job semanal desatendido eso convierte una falla transitoria de la API en
-pérdida permanente de datos: las 4 métricas `circle_activity_score`, `_presence`,
+limpiaba. En un job desatendido eso convierte una falla transitoria de la API en
+pérdida permanente de datos —y a diario, la convierte todos los días—: las 4 métricas
+`circle_activity_score`, `_presence`,
 `_participacion` y `_contribucion` salen de un objeto anidado (`activity_score`) que Circle
 **no incluye para miembros sin actividad**; si algún día dejara de incluirlo para todos, la
 corrida siguiente habría vaciado los 337 contactos que hoy lo tienen.
@@ -121,6 +183,24 @@ El sync puede terminar "verde" con lotes parcialmente rechazados. `verificar_sco
 cuenta los contactos **directamente en HubSpot** en vez de confiar en el log, y el workflow
 lo corre después de cada sync. Si falla, la corrida falla.
 
+### Una propiedad que el sync ya no puede corregir
+
+`eventos_pl_asistencias_12m` está poblada en **1.892** contactos, de los cuales **1.831
+no son miembros de Circle** (medido 2026-08-11). Vienen del diseño anterior, que la
+aproximaba con listas de Brevo (`Inscritos - Eventos - <País>`); desde el 2026-07-30 sale
+del RSVP real de Circle, que hoy cubre 6 eventos y 61 contactos.
+
+Como el sync **omite `None`** (ver abajo, y es la decisión correcta), esos 1.831 valores
+no se pisan ni se bajan nunca: `circle_eventos()` sólo devuelve a quien tiene un RSVP
+dentro de la ventana de 365 días, y a quien se le vence simplemente desaparece del dict.
+O sea que es un contador de ventana móvil **que sólo puede subir**, y el scoring nativo
+está puntuando sobre eso.
+
+Correr a diario no lo arregla y lo hace parecer más fresco de lo que está. Es la misma
+clase de falla que el bug de la categoría `ignorar`, y necesita el mismo tratamiento: un
+backfill deliberado de una vez, con su guarda — no un cambio a la regla de omitir `None`.
+Anotado en `hubspot_admin/ESTADO.md`.
+
 ## Historia: qué reemplaza esto
 
 Dos jobs de `launchd` en el Mac de Emilio, que fallaban en silencio:
@@ -133,23 +213,42 @@ Dos jobs de `launchd` en el Mac de Emilio, que fallaban en silencio:
 Además ambos ejecutaban los scripts **viejos** (13 propiedades entre los dos); el sync
 unificado que alimenta el scoring —este— no estaba programado en ninguna parte.
 
-⚠️ **Al activar este repo hay que desinstalar los dos jobs de `launchd`**, o van a competir
-escribiendo las mismas propiedades:
+✅ **Los tres jobs de `launchd` se eliminaron el 2026-08-04** (`bootout` + `remove` + `rm`
+de los plists, verificado con `launchctl list` vacío). Hasta ese día seguían cargados y
+disparando aunque el tracker los daba por desinstalados. No fallaban por diseño sino por
+TCC, y ése era el único motivo por el que no colisionaban: el viejo de Circle estaba
+programado el **mismo instante** que GitHub Actions sobre las mismas propiedades. Conceder
+*Full Disk Access* —la reacción natural frente a `Operation not permitted`— habría
+arrancado la colisión. El relato está en `hubspot_admin/_historico/`.
 
-```bash
-launchctl unload ~/Library/LaunchAgents/com.procure.circle-hubspot-sync.plist
-launchctl unload ~/Library/LaunchAgents/com.procure.brevo-hubspot-sync.plist
-rm ~/Library/LaunchAgents/com.procure.{circle,brevo}-hubspot-sync.plist
-```
+### Una propiedad que se perdió en el cambio, a propósito
 
-### Una propiedad que se pierde en el cambio
+`circle_likes_dados` (75 contactos con dato, congelada) la escribía el sync **viejo** de
+Circle y este **no**. **No la portes.** En el código viejo la línea es
+`likes[em] = p["member_likes_count"]` **dentro del loop de posts**: es last-write-wins del
+último post de ese autor, no una suma ni un total del miembro (el campo a nivel miembro no
+existe en `community_members`). Portarlo sería portar un agregado basura. Decisión
+pendiente de marketing: archivar la propiedad, o definir bien qué medir y calcularlo.
 
-`circle_likes_dados` (75 contactos con dato) la escribía el sync **viejo** de Circle y este
-**no**. Si marketing la usa en el scoring, hay que portarla antes de desinstalar el job
-viejo. Si no la usa, se archiva la propiedad y listo.
+## Dos gotchas de GitHub Actions que ya nos costaron
 
-## Gotcha de GitHub Actions
+**1. GitHub desactiva los workflows programados** de un repo sin actividad por 60 días, y
+la actividad que cuenta es un **commit** — no las corridas del propio cron. Un repo que
+sólo tiene un sync andando solo, funcionando perfecto, se apaga a los 60 días por hacer
+exactamente lo que se le pidió. Lo previene `keep-alive.yml` (commitea `.latido` el día 1
+de cada mes, dos veces por dentro de la ventana); si igual pasa, lo detecta el dead-man's
+switch. `keep-alive.yml` también es un cron y también puede quedar desactivado: por eso
+hacen falta las dos cosas.
 
-GitHub **desactiva los workflows programados** de un repo sin actividad por 60 días. Si el
-repo queda quieto, revisar en la pestaña *Actions* que el schedule siga habilitado. Un
-commit cualquiera reinicia el contador.
+**2. El cron no dispara a la hora que dice.** Medido en este repo:
+
+| Cron nominal | Disparó | Atraso |
+|---|---|---|
+| lun 11:00 UTC (2026-08-03) | 17:28 UTC | **6 h 28 min** |
+| lun 11:00 UTC (2026-08-10) | 14:40 UTC | **3 h 40 min** |
+
+El minuto 0 de una hora en punto es el slot más congestionado del scheduler compartido.
+Los tres workflows de acá usan minutos impares (17, 23, 41) para bajar la cola, pero eso
+**no la elimina**: no construyas nada que dependa de la hora exacta, y dale al
+dead-man's switch una holgura de horas, no de minutos. El 2026-08-10 alguien revisó a las
+14:05, no vio la corrida y la dio por no ejecutada; había disparado 35 minutos después.

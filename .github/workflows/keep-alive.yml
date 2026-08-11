@@ -1,0 +1,49 @@
+name: Keep-alive (que GitHub no desactive los cron)
+
+# GitHub desactiva los workflows PROGRAMADOS de un repo sin actividad por 60 días, y
+# la actividad que cuenta es un commit — no las corridas del propio cron. O sea: un
+# repo que sólo tiene un sync andando solo, funcionando perfecto, se apaga a los 60
+# días por estar haciendo exactamente lo que se le pidió.
+#
+# Este job commitea un archivo de latido el día 1 de cada mes. Dos veces por dentro
+# de la ventana de 60 días, así que un mes que falle no apaga nada.
+#
+# No reemplaza al dead-man's switch: esto PREVIENE la desactivación, el switch la
+# DETECTA. Hacen falta las dos — este workflow también es un cron y también puede
+# quedar desactivado.
+
+on:
+  schedule:
+    # Día 1 de cada mes, 12:41 UTC. Minuto impar, misma razón que en los otros dos.
+    - cron: '41 12 1 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: keep-alive
+  cancel-in-progress: false
+
+jobs:
+  latido:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Commitear el latido
+        run: |
+          date -u '+%Y-%m-%dT%H:%M:%SZ' > .latido
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .latido
+          # `--quiet` devuelve 1 cuando SÍ hay cambios; el `||` evita fallar cuando no
+          # los hay (dos corridas el mismo segundo, un re-run manual).
+          if git diff --staged --quiet; then
+            echo "Sin cambios; nada que commitear."
+          else
+            git commit -m "Keep-alive: reiniciar el contador de 60 días de GitHub Actions"
+            git push
+            echo "Latido commiteado."
+          fi

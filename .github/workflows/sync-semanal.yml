@@ -1,25 +1,33 @@
-name: Sync semanal Circle + Brevo → HubSpot
+name: Sync semanal Brevo → HubSpot
 
-# Corre solo, todas las semanas, sin depender de que ninguna laptop esté prendida.
+# Brevo, una vez por semana. 20-25 minutos (~22.500 llamadas, una por contacto).
+#
+# ⚠️ Desde 2026-08-11 este workflow YA NO corre Circle: Circle se movió a
+# `sync-diario.yml`. La corrida programada de acá es `--solo brevo`. Si necesitas las
+# dos fuentes en una sola pasada, dispáralo a mano con `solo=ambas`.
 #
 # Reemplaza dos jobs de launchd que corrían en el Mac de Emilio y que fallaban en
 # silencio: `com.procure.circle-hubspot-sync` venía muriendo desde el 2026-07-27 con
 # "Operation not permitted" (macOS TCC no deja que launchd lea ~/Downloads sin Full
 # Disk Access), y el de Brevo nunca alcanzó a correr programado.
 #
-# ⚠️ GitHub desactiva los workflows programados de un repo sin actividad por 60 días.
-# Si el repo queda quieto, revisar que el schedule siga habilitado en la pestaña Actions.
+# ⚠️ GitHub desactiva los workflows programados de un repo sin actividad de commits
+# por 60 días. Lo previene `keep-alive.yml`; si igual pasa, lo detecta el dead-man's
+# switch. No confíes en acordarte.
 
 on:
   schedule:
-    # Miercoles 11:00 UTC ≈ 07:00 en Chile (UTC-4). GitHub puede atrasar el disparo unos
-    # minutos cuando hay cola; para este sync es irrelevante.
+    # Miercoles 11:23 UTC ≈ 07:23 en Chile (UTC-4).
     #
     # Por que miercoles y no lunes: el newsletter sale los MARTES. Con el cron en lunes
     # el sync corria el dia antes del envio, asi que las aperturas y clics de cada
     # campana esperaban 7 dias enteros para llegar a HubSpot. Miercoles las recoge ~24 h
     # despues del envio, que es donde ya cayo el grueso de la apertura.
-    - cron: '0 11 * * 3'
+    #
+    # Por que el minuto 23 y no 0: con `0 11` las dos unicas corridas programadas
+    # dispararon 6 h 28 min y 3 h 40 min tarde. El minuto 0 es el slot mas congestionado
+    # del scheduler de GitHub. Un minuto impar ayuda; no garantiza nada.
+    - cron: '23 11 * * 3'
   workflow_dispatch:
     inputs:
       dry_run:
@@ -31,15 +39,13 @@ on:
         type: string
         default: ''
       solo:
-        # La fase de Brevo son ~20 de los ~28 minutos (22.500 llamadas). Cuando solo
-        # hace falta refrescar Circle, `circle` corre en ~2 min y no manda ninguna
-        # propiedad de Brevo (no las manda en None: no las incluye en el payload).
-        description: 'Correr una sola fuente: circle | brevo (vacío = ambas)'
+        description: 'Fuente a correr (la programada usa brevo; Circle va en sync-diario.yml)'
         type: choice
-        options: ['', 'circle', 'brevo']
-        default: ''
+        options: ['brevo', 'circle', 'ambas']
+        default: 'brevo'
 
-# Dos corridas en paralelo escribirían las mismas propiedades a la vez. La nueva espera.
+# Mismo grupo que `sync-diario.yml` — los grupos son del REPO, no del workflow. Es lo
+# que evita que un miércoles el diario de Circle y esta corrida escriban a la vez.
 concurrency:
   group: sync-circle-brevo
   cancel-in-progress: false
@@ -65,7 +71,22 @@ jobs:
       - name: Instalar dependencias
         run: pip install -r requirements.txt
 
-      - name: Sync Circle + Brevo → HubSpot
+      - name: Resolver alcance
+        # En una corrida programada `inputs.solo` viene vacío, y el default del input
+        # sólo aplica a workflow_dispatch. Sin este paso el cron correría las DOS
+        # fuentes y volvería a pisar a Circle todos los miércoles.
+        run: |
+          SOLO="${{ inputs.solo }}"
+          [ -z "$SOLO" ] && SOLO="brevo"
+          echo "SOLO=$SOLO" >> "$GITHUB_ENV"
+          if [ "$SOLO" = "ambas" ]; then
+            echo "ALCANCE=" >> "$GITHUB_ENV"
+          else
+            echo "ALCANCE=--solo $SOLO" >> "$GITHUB_ENV"
+          fi
+          echo "Alcance de esta corrida: $SOLO"
+
+      - name: Sync → HubSpot
         env:
           # Los tokens llegan como variables de entorno reales; no hay .env en CI.
           # `load_env()` usa setdefault, así que estos ganan sobre cualquier archivo.
@@ -75,10 +96,9 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p logs
-          ARGS=""
+          ARGS="$ALCANCE"
           if [ "${{ inputs.dry_run }}" = "true" ]; then ARGS="$ARGS --dry-run"; fi
           if [ -n "${{ inputs.limite }}" ]; then ARGS="$ARGS --limite ${{ inputs.limite }}"; fi
-          if [ -n "${{ inputs.solo }}" ]; then ARGS="$ARGS --solo ${{ inputs.solo }}"; fi
           echo "Corriendo: sync_circle_brevo.py $ARGS"
           python -u sync_circle_brevo.py $ARGS 2>&1 | tee logs/sync.log
 
@@ -86,6 +106,9 @@ jobs:
         # Guarda obligatoria: el sync puede terminar "verde" con lotes parcialmente
         # rechazados. Esto cuenta los contactos directamente en HubSpot en vez de
         # confiar en el log. Se salta en dry-run porque no se escribió nada.
+        #
+        # Va con el MISMO alcance que el sync: si esta corrida no tocó Circle, no puede
+        # fallar por una señal de Circle.
         if: ${{ inputs.dry_run != true }}
         env:
           HUBSPOT_TOKEN: ${{ secrets.HUBSPOT_TOKEN }}
@@ -93,7 +116,50 @@ jobs:
           CIRCLE_API_TOKEN: ${{ secrets.CIRCLE_API_TOKEN }}
         run: |
           set -o pipefail
-          python -u verificar_scoring.py 2>&1 | tee logs/verificacion.log
+          python -u verificar_scoring.py $ALCANCE 2>&1 | tee logs/verificacion.log
+
+      - name: Resumen en la corrida
+        if: always()
+        run: |
+          {
+            echo "## Sync semanal ($SOLO)"
+            echo ""
+            echo '```'
+            tail -n 30 logs/sync.log 2>/dev/null || echo "(sin log de sync)"
+            echo '```'
+            echo ""
+            echo "### Read-back"
+            echo '```'
+            tail -n 30 logs/verificacion.log 2>/dev/null || echo "(no corrió)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Latido (dead-man's switch)
+        # Ninguna alerta dentro de GitHub Actions puede avisarte que GitHub no corrió.
+        # Configurar en Healthchecks.io con period=7 days y grace=12 hours.
+        if: success()
+        env:
+          URL: ${{ secrets.HEARTBEAT_SEMANAL_URL }}
+        run: |
+          if [ -z "$URL" ]; then
+            echo "::warning::HEARTBEAT_SEMANAL_URL no está configurado — este sync NO tiene dead-man's switch."
+            exit 0
+          fi
+          curl -fsS -m 10 --retry 3 "$URL" > /dev/null && echo "Latido enviado."
+
+      - name: Avisar a Slack si falló
+        if: failure()
+        env:
+          WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -z "$WEBHOOK" ]; then
+            echo "::warning::SLACK_WEBHOOK_URL no está configurado — la falla sólo se avisa por mail."
+            exit 0
+          fi
+          RUN="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          printf '{"text":"🔴 Sync semanal (%s) → HubSpot FALLÓ. Revisar: %s"}' "$SOLO" "$RUN" \
+            | curl -fsS -m 10 -X POST -H 'Content-Type: application/json' -d @- "$WEBHOOK" > /dev/null
+          echo "Aviso enviado a Slack."
 
       - name: Guardar logs
         # `always()` para que los logs queden disponibles justo cuando la corrida falla,
