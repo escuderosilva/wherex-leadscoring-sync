@@ -7,7 +7,8 @@ Corre solo en **GitHub Actions**. No depende de que ninguna laptop esté prendid
 
 | | |
 |---|---|
-| **Qué escribe** | 25 propiedades de Contacto en HubSpot (`circle_*` y `brevo_*`) |
+| **Qué escribe** | 25 propiedades de Contacto en HubSpot (`circle_*` y `brevo_*`), más `firstname`/`lastname`/`jobtitle`/`country` **sólo donde están vacías** |
+| **Qué NO hace** | **crear contactos.** Actualiza los que existen, por `hs_object_id`. Ver §Este sync no crea contactos |
 | **Circle** | **todos los días**, 10:17 UTC (≈ 06:17 Chile) · `.github/workflows/sync-diario.yml` · ~40 s |
 | **Brevo** | **miércoles** 11:23 UTC (≈ 07:23 Chile) · `.github/workflows/sync-semanal.yml` · 20-25 min. El newsletter sale los **martes**: lo recoge ~24 h después del envío. |
 | **Portal HubSpot** | 51404466 (producción) |
@@ -50,6 +51,61 @@ por una señal de Brevo que no tocó**. A 365 corridas por año, una alerta que 
 roja por algo que el job no controla se aprende a ignorar en una semana — es el mismo
 error que tuvo este repo hasta el 2026-08-04, cuando el job salía rojo todos los
 miércoles por 22 emails con TLD malformado y eso mantenía el read-back desactivado.
+
+## Este sync no crea contactos
+
+Antes sí, sin que nadie lo hubiera decidido. Escribía con `batch/upsert` +
+`idProperty=email`, que es **create-or-update**: cada email de Brevo o Circle que no
+existía en HubSpot entraba como **contacto nuevo** con nada más que propiedades de
+marketing — sin nombre, sin empresa y sin `status_contacto`.
+
+Lo que costó, medido el 2026-08-11: **9.593 contactos sin nombre** en el portal. 6.623 por
+el import del 21-jul y **2.964 por las corridas del 29 y 30 de julio de este sync**. Esos
+2.964 aparecen en HubSpot como `INTEGRACIÓN · Migración API`, no como Brevo, porque este
+sync usa **la misma app privada que el ETL de Salesforce** (`hs_object_source_id
+43401597`): el informe de calidad de datos los contó como migración durante dos semanas.
+
+Cómo quedó:
+
+1. `resolver()` hace `batch/read` por email antes de escribir (~226 llamadas para 22,5k
+   emails, ~2 min). Sabe quién existe y quién no.
+2. Los que existen se actualizan con **`batch/update` por `hs_object_id`**. Ese endpoint no
+   puede crear: la clase de bug entera desaparece, no se mitiga.
+3. Los que no existen van a **`contactos_sin_crear.csv`** y no entran al CRM. Brevo es el
+   sistema de audiencia; HubSpot es el CRM. Un suscriptor del newsletter sin nombre y sin
+   empresa no es un registro de CRM: es una fila de una lista. La decisión de qué hacer con
+   ellos es de marketing, no de un cron.
+
+**Dos fallos viejos se van de arrastre**, porque el update por id no valida el email: los
+**22 contactos con TLD malformado** heredados de Salesforce (`.ocm`, `.con`, `.cpm`) por fin
+reciben sus propiedades — era la única causa por la que el job salía rojo todas las semanas
+— y desaparece el bug "un email inválido tumba el lote de 100".
+
+### Y el nombre venía en la misma llamada
+
+`brevo_contactos()` hacía `GET /contacts` y se quedaba **sólo con `emailBlacklisted`**. En
+el `attributes` que descartaba venía FIRSTNAME (79,7% de la cuenta), COMPANY (75,3%),
+COUNTRY (73,8%), LASTNAME (55,9%) y JOB_TITLE (46,5%).
+
+Ahora se mapea, con dos reglas que no son negociables:
+
+- **Sólo se escribe si el campo está vacío en HubSpot.** Nunca encima de un valor
+  existente: las cargas CSV del 20/21/23-jul pisaron 32.295 nombres y repararlos costó un
+  frente entero. Un cron desatendido no puede tener permiso de sobrescribir identidad.
+- **El split resta, no copia.** Brevo guarda el nombre completo en `FIRSTNAME` y sólo el
+  primer apellido en `LASTNAME` (`'Catalina Andrea Araya Tejada'` + `'Araya'`). Copiar
+  `FIRSTNAME` tal cual reproduce exactamente el daño de los 32.295. La lógica está en
+  `identidad_brevo.py`, con 18 casos de autoprueba (`python3 identidad_brevo.py`), y lo
+  ambiguo **no se escribe**.
+
+`COMPANY` se lee pero no se escribe: en ese portal la empresa del contacto vive en la
+asociación a la Empresa, no en el campo de texto. Sale en el CSV para el frente que
+corresponde.
+
+> `identidad_brevo.py` es una **copia autocontenida** de
+> `calidad_datos/brevo_identidad/nombres_brevo.py` del repo `hubspot_admin`, que es la
+> fuente de verdad. Son dos repos y no se pueden importar entre sí. **Si cambias la lógica,
+> cambiala en las dos**; las dos corren la misma autoprueba.
 
 ## División de trabajo (importante)
 

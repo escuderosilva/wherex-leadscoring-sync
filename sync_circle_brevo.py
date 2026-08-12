@@ -39,10 +39,20 @@ Uso:
   python sync_circle_brevo.py --limite 50      # smoke test acotado (tope de escritura)
   python sync_circle_brevo.py --generar-mapeo  # semilla de actividades_mkt.csv
 
-Idempotente: recalcula desde la fuente y hace upsert por email. Correrlo dos
-veces seguidas deja el mismo estado.
+Idempotente: recalcula desde la fuente y **actualiza contactos existentes por
+hs_object_id**. Correrlo dos veces seguidas deja el mismo estado.
+
+⚠️ **Este sync NO crea contactos** (cambio del 2026-08-11). Antes escribia con
+`batch/upsert` + `idProperty=email`, que es create-or-update: cada email de Brevo o
+Circle ausente en HubSpot entraba como contacto nuevo con solo propiedades de
+marketing -- sin nombre, sin empresa y sin `status_contacto`. Asi entraron 9.587
+contactos sin nombre (6.623 por el import del 21-jul y 2.964 por las corridas del
+29-30 de jul, estos ultimos etiquetados `INTEGRACION - Migracion API` porque este
+sync usa la misma app privada que el ETL de Salesforce). Ahora se resuelve la
+existencia primero y los ausentes quedan en un CSV de revision. Ver `escribir()`.
 """
 import argparse
+import collections
 import concurrent.futures
 import csv
 import datetime as dt
@@ -57,6 +67,8 @@ from collections import defaultdict
 
 warnings.filterwarnings("ignore")
 import requests
+
+import identidad_brevo as IB
 
 
 ENV_REQUERIDAS = ("HUBSPOT_TOKEN", "BREVO_API_KEY", "CIRCLE_API_TOKEN")
@@ -353,9 +365,29 @@ def circle_todo():
 
 # --------------------------------------------------------------------------- brevo
 def brevo_contactos():
-    """{email: {enviados/aperturas/clics/desuscrito/...}} paginando /contacts.
+    """{email: {desuscrito + identidad}} paginando /contacts.
 
     17 llamadas para ~16.600 contactos (limit=1000), en vez de una por contacto.
+
+    **Identidad (agregado 2026-08-11).** Hasta hoy esta función se quedaba SÓLO con
+    `emailBlacklisted` y descartaba el resto de la respuesta. En ese resto venía el
+    nombre: medido sobre los 22.585 contactos de la cuenta, `attributes` trae
+    FIRSTNAME en el 79,7%, COMPANY en el 75,3%, COUNTRY en el 73,8% y JOB_TITLE en
+    el 46,5%. Como el write era `batch/upsert` por email —o sea, create-or-update—,
+    cada email de Brevo que no existía en HubSpot se convertía en un contacto nuevo
+    con nada más que métricas de email: **9.587 contactos sin nombre** entre el
+    import del 21-jul y las corridas del 29-30 de jul. El dato para arreglarlos
+    venía en la misma llamada que ya se pagaba.
+
+    Las claves de identidad van con prefijo `_id_` y `escribir()` las trata distinto
+    de las métricas: se escriben **sólo si el campo está vacío en HubSpot**, nunca
+    encima de un valor existente. Ver el docstring de `escribir()`.
+
+    COMPANY se lee pero NO se escribe como `company`: en este portal la empresa del
+    contacto vive en la **asociación** a la Empresa (1.750 de 141.457 contactos
+    tienen el campo de texto poblado, contra 86.681 que tienen `country`). Se emite
+    al CSV de `data/` para que lo consuma `calidad_datos/asociar_empresas.py`, que
+    es el dueño de ese frente.
     """
     out, offset = {}, 0
     while offset < 200_000:
@@ -367,7 +399,19 @@ def brevo_contactos():
             email = (c.get("email") or "").strip().lower()
             if not email:
                 continue
-            out[email] = {"brevo_desuscrito": "true" if c.get("emailBlacklisted") else "false"}
+            a = c.get("attributes") or {}
+            n = IB.partir(a.get("FIRSTNAME"), a.get("LASTNAME"), email)
+            out[email] = {
+                "brevo_desuscrito": "true" if c.get("emailBlacklisted") else "false",
+                # `revisar` y `descartar` no aportan nombre: quedan en None y no se
+                # escriben (ver el filtro de `escribir`). No se adivina un split.
+                "_id_firstname": n["firstname"] or None,
+                "_id_lastname": n["lastname"] or None,
+                "_id_jobtitle": (a.get("JOB_TITLE") or "").strip() or None,
+                "_id_country": (a.get("COUNTRY") or "").strip() or None,
+                "_brevo_company": (a.get("COMPANY") or "").strip() or None,
+                "_brevo_banda": n["banda"],
+            }
         offset += 1000
     return out
 
@@ -727,11 +771,24 @@ def _postear_lote(lote, nivel=0, intento=0):
     # Omitir significa que este sync no puede vaciar una propiedad a proposito. Es el
     # intercambio correcto: "no lo se" y "esta vacio" son cosas distintas, y para
     # limpiar un campo a mano estan la UI de HubSpot o un script puntual.
-    body = {"inputs": [{"idProperty": "email", "id": e,
+    body = {"inputs": [{"id": i,
                         "properties": {k: str(v) for k, v in p.items() if v is not None}}
-                       for e, p in lote]}
+                       for i, p in lote]}
     try:
-        r = requests.post(f"{HS}/crm/v3/objects/contacts/batch/upsert",
+        # `batch/update` por hs_object_id, NO `batch/upsert` por email.
+        #
+        # El upsert por email es create-or-update: todo email de Brevo ausente en
+        # HubSpot se convertía en un contacto nuevo con sólo métricas de marketing.
+        # Así entraron 2.995 contactos el 29-30 de jul, etiquetados `INTEGRATION ·
+        # Migración API` porque este sync usa la misma app privada que el ETL de
+        # Salesforce. Nunca fue una decisión de diseño: era el efecto colateral de
+        # elegir upsert para enriquecer. Actualizar por id lo vuelve imposible.
+        #
+        # Efecto secundario: los 22 emails con TLD malformado heredados de Salesforce
+        # (.ocm/.con/.cpm) dejan de fallar. HubSpot los rechazaba al validar el email
+        # del upsert; un update por id no toca el email, así que esos contactos por
+        # fin reciben sus métricas. Es el fallo permanente que tenía el job en rojo.
+        r = requests.post(f"{HS}/crm/v3/objects/contacts/batch/update",
                           headers=_h_hs(), json=body, timeout=60)
     except requests.exceptions.RequestException as e:
         if intento < 5:
@@ -748,16 +805,13 @@ def _postear_lote(lote, nivel=0, intento=0):
         return _postear_lote(lote, nivel, intento + 1)
 
     if r.status_code == 400:
-        malos = {m.lower() for m in RE_INVALIDO.findall(r.text)}
-        quedan = [(e, p) for e, p in lote if e.lower() not in malos] if malos else lote
-        # Solo recursamos si el reintento va a ser distinto del intento actual. Si
-        # HubSpot nombra un email que no coincide exacto con ninguna clave del lote
-        # (comillas, puntuacion, otra normalizacion), `quedan == lote` y esta rama se
-        # llamaria a si misma con el mismo lote hasta reventar por RecursionError.
-        if malos and len(quedan) < len(lote) and nivel < 8:
-            esc, fal, desc = _postear_lote(quedan, nivel + 1, 0)
-            return esc, fal + len(lote) - len(quedan), desc + sorted(malos)
-        if not malos and len(lote) > 1 and nivel < 8:
+        # Ya no se parsea el email culpable del cuerpo del error: con `batch/update`
+        # por id el email no viaja, así que el 400 por email inválido no puede
+        # ocurrir (era el bug B del 2026-07-29, que costó 1.700 contactos). Lo que sí
+        # puede aparecer es un 400 por otra causa —INVALID_OPTION en una enum, por
+        # ejemplo— y para eso queda la bisección: un registro malo no debe arrastrar
+        # a los otros 99.
+        if len(lote) > 1 and nivel < 8:
             mitad = len(lote) // 2
             a = _postear_lote(lote[:mitad], nivel + 1, 0)
             b = _postear_lote(lote[mitad:], nivel + 1, 0)
@@ -767,19 +821,145 @@ def _postear_lote(lote, nivel=0, intento=0):
     return 0, len(lote), []
 
 
-def escribir(por_email, dry_run=False, limite=None):
-    """Upsert por email en lotes de 100 (batch/upsert con idProperty=email).
+# Identidad: destino en HubSpot de cada clave `_id_*` que trae `brevo_contactos()`.
+# Sólo se escriben si el campo está VACÍO en HubSpot (ver `resolver`).
+DESTINO_IDENTIDAD = {"_id_firstname": "firstname", "_id_lastname": "lastname",
+                     "_id_jobtitle": "jobtitle", "_id_country": "country"}
+# Claves internas que nunca se mandan a HubSpot como propiedad.
+INTERNAS = set(DESTINO_IDENTIDAD) | {"_brevo_company", "_brevo_banda"}
 
-    OJO (aprendizajes §13): la respuesta del batch/upsert NO viene en el orden de
-    entrada. Aca no se mapea la respuesta, solo se cuenta; si alguna vez hay que
-    leerla, mapear por properties[idProperty] y nunca por posicion.
+# Piso de cordura del DESTINO (complemento de MIN_MIEMBROS_CIRCLE, que cuida el ORIGEN).
+#
+# `resolver()` es el unico lugar que sabe cuantos de los contactos leidos existen en
+# HubSpot, asi que es el unico que puede detectar que el `batch/read` se rompio. Y se
+# rompe en silencio: un token sin scope de lectura, un cambio de contrato o un 400 por
+# lote devuelven `results` vacios, no una excepcion. Con `out` vacio, TODOS los contactos
+# caen en "no existe" -> no se escribe nada, no se crea nada (el parche del 2026-08-11 lo
+# garantiza), la corrida termina en VERDE y el CSV de revision reporta que la audiencia
+# entera desaparecio del CRM. Un cron diario acumula eso sin que nadie se entere.
+#
+# Es RELATIVO a proposito: los dos ramos tienen tasas de resolucion muy distintas en
+# valor absoluto (Circle 387/399, Brevo ~22.200/22.585) pero las dos por encima del 95%.
+# Un piso relativo sirve para ambos sin numeros por rama que despues nadie ajusta.
+#
+# 50% y no 90%: por debajo de la mitad no hay explicacion legitima, mientras que una
+# carga grande de audiencia nueva en Brevo si puede mover la tasa 10 o 20 puntos y no es
+# un error. Esto detecta el fallo de infraestructura, no el cambio de negocio.
+MIN_TASA_RESOLUCION = 0.5
+
+
+def resolver(emails):
+    """{email_de_ENTRADA: {"id": ..., "vacios": {props vacías en HubSpot}}}.
+
+    Un `batch/read` por email de 100 en 100 (~226 llamadas para los 22,5k de Brevo,
+    ~2 min). Los emails que no vuelven **no existen en HubSpot**, y ésa es justamente
+    la información que el upsert por email ocultaba: creaba el contacto y nadie se
+    enteraba.
+
+    🔴 **Se indexa por el email de ENTRADA, no por el que devuelve HubSpot.** Esta
+    función tuvo el bug exacto que `../hubspot_admin/esquema/aprendizajes/
+    HubSpot_Aprendizajes.md` §15.11 ya tenía documentado, y conviene dejarlo escrito
+    porque es contraintuitivo:
+
+    `batch/read` con `idProperty=email` **sí resuelve emails secundarios**
+    (`hs_additional_emails`): le pasas un alias y te devuelve el contacto — pero con su
+    email **PRIMARIO** en `properties.email`, y **sin eco del id que pediste**. Indexar
+    por el email devuelto hace que el alias no aparezca nunca en el resultado, así que
+    el llamador lo cuenta como "no existe en HubSpot".
+
+    Con el write viejo (`batch/upsert` por email) eso era inofensivo: HubSpot resolvía
+    el alias del lado del servidor y escribía en el contacto correcto. Con el write
+    nuevo (update por id) **el contacto simplemente deja de actualizarse**, en silencio
+    y en cada corrida. Medido en la rama de Circle: 12 de los 13 "ausentes" eran alias
+    de contactos vivos —casi todos correcciones de tipeo de dominio
+    (`blanca.jimenez@tec.mc` → `@tec.mx`)— o sea 12 miembros reales de la comunidad
+    perdiendo su scoring todos los días. El único ausente de verdad era 1.
+
+    El arreglo: pedir `hs_additional_emails` e indexar el contacto por **todas** sus
+    direcciones. Así cualquier email de entrada que resuelva se encuentra por la clave
+    con la que se preguntó.
     """
-    # `if p` solo probaba que el dict no estuviera vacio. Un contacto con todas sus
-    # propiedades en None (p. ej. solo alcanzado por circle_posts() con una fecha que
-    # no parsea) pasaba el filtro y, como el write es batch/upsert por email, CREABA
-    # un contacto pelado en HubSpot con nada mas que el email.
+    campos = list(DESTINO_IDENTIDAD.values())
+    out = {}
+    for i in range(0, len(emails), 100):
+        lote = emails[i:i + 100]
+        body = {"idProperty": "email",
+                "properties": campos + ["email", "hs_additional_emails"],
+                "inputs": [{"id": e} for e in lote]}
+        for intento in range(6):
+            try:
+                r = requests.post(f"{HS}/crm/v3/objects/contacts/batch/read",
+                                  headers=_h_hs(), json=body, timeout=60)
+            except requests.exceptions.RequestException:
+                time.sleep(min(2 ** intento, 30))
+                continue
+            # 207 = multi-status: parte del lote existe y parte no. Es el caso normal.
+            if r.ok or r.status_code == 207:
+                break
+            if r.status_code in (429, 500, 502, 503, 504):
+                time.sleep(float(r.headers.get("Retry-After", min(2 ** intento, 30))))
+                continue
+            print(f"  batch/read: {r.status_code} {r.text[:160]}", file=sys.stderr)
+            break
+        else:
+            continue
+        d = r.json() or {}
+        pedidos = {e.strip().lower() for e in lote}
+        for res in d.get("results", []):
+            p = res.get("properties") or {}
+            info = {"id": res["id"],
+                    "vacios": {c for c in campos if not (p.get(c) or "").strip()}}
+            # Todas las direcciones del contacto: la primaria y cada alias. El email de
+            # entrada es una de ellas, y es la clave con la que el llamador va a buscar.
+            direcciones = [p.get("email") or ""]
+            direcciones += (p.get("hs_additional_emails") or "").split(";")
+            for dir_ in direcciones:
+                dir_ = dir_.strip().lower()
+                # Sólo se indexan las direcciones que ALGUIEN pidió en este lote. Sin
+                # esto, un contacto con 5 alias mete 5 claves y la tasa de resolución
+                # queda inflada por encima del 100%.
+                if dir_ and dir_ in pedidos:
+                    out[dir_] = info
+    tasa = len(out) / len(emails) if emails else 1.0
+    if tasa < MIN_TASA_RESOLUCION:
+        raise RuntimeError(
+            f"Solo {len(out)} de {len(emails)} emails se resolvieron en HubSpot "
+            f"({tasa:.0%}, piso {MIN_TASA_RESOLUCION:.0%}). No se escribe nada. Es mucho "
+            f"mas probable que el batch/read este fallando en silencio (scope del token, "
+            f"cambio de contrato, 400 por lote) que un CRM que perdio la mitad de su base. "
+            f"Si de verdad entro una audiencia nueva enorme, baja MIN_TASA_RESOLUCION."
+        )
+    return out
+
+
+def escribir(por_email, dry_run=False, limite=None, crear_nuevos=False,
+             csv_nuevos="contactos_sin_crear.csv"):
+    """Actualiza contactos EXISTENTES por id, en lotes de 100. Nunca crea.
+
+    Dos cambios de fondo respecto de la versión anterior (2026-08-11):
+
+    1. **No crea.** Antes escribía con `batch/upsert` + `idProperty=email`, que es
+       create-or-update: cada email de Brevo ausente en HubSpot entraba como contacto
+       nuevo con sólo métricas de marketing. Ahora se resuelve la existencia primero
+       (`resolver`) y los ausentes van a un CSV de revisión, no al CRM. Brevo es el
+       sistema de audiencia; HubSpot es el CRM. Un suscriptor del newsletter sin
+       nombre y sin empresa no es un registro de CRM: es una fila de una lista.
+       `--crear-nuevos` restaura el comportamiento viejo, explícito y a pedido.
+
+    2. **Completa la identidad, sin pisarla.** `firstname`/`lastname`/`jobtitle`/
+       `country` se escriben **sólo si están vacíos en HubSpot**. Nunca encima de un
+       valor que ya está: las cargas CSV del 20/21/23-jul pisaron 32.295 nombres y
+       repararlos costó un frente entero (`calidad_datos/BITACORA.md` §10). Un sync
+       semanal desatendido no puede tener permiso de sobrescribir identidad.
+
+    OJO (aprendizajes §13): la respuesta del batch NO viene en el orden de entrada.
+    Acá no se mapea la respuesta, sólo se cuenta.
+    """
+    # Un contacto con todo en None no aporta nada. Se mira sólo el payload de
+    # marketing: las claves internas `_id_*` no cuentan como señal, si no cualquier
+    # contacto de Brevo con nombre pasaría el filtro sin tener una sola métrica.
     items = [(e, p) for e, p in por_email.items()
-             if any(v is not None for v in p.values())]
+             if any(v is not None for k, v in p.items() if k not in INTERNAS)]
     descartados_regex = [e for e, _ in items if not RE_EMAIL.match(e)]
     if descartados_regex:
         items = [(e, p) for e, p in items if RE_EMAIL.match(e)]
@@ -788,35 +968,100 @@ def escribir(por_email, dry_run=False, limite=None):
               file=sys.stderr)
     if limite:
         items = items[:limite]
-    print(f"\nA escribir: {len(items)} contactos", file=sys.stderr)
+
+    print(f"\nResolviendo {len(items)} emails contra HubSpot (batch/read)...",
+          file=sys.stderr)
+    existentes = resolver([e for e, _ in items])
+    ausentes = [(e, p) for e, p in items if e not in existentes]
+    presentes = [(e, p) for e, p in items if e in existentes]
+    print(f"  existen en HubSpot: {len(presentes)} · NO existen: {len(ausentes)}",
+          file=sys.stderr)
+
+    if ausentes:
+        with open(csv_nuevos, "w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            w.writerow(["email", "firstname", "lastname", "jobtitle", "country",
+                        "company_brevo", "banda_nombre", "desuscrito"])
+            for e, p in ausentes:
+                w.writerow([e, p.get("_id_firstname") or "", p.get("_id_lastname") or "",
+                            p.get("_id_jobtitle") or "", p.get("_id_country") or "",
+                            p.get("_brevo_company") or "", p.get("_brevo_banda") or "",
+                            p.get("brevo_desuscrito") or ""])
+        con_nombre = sum(1 for _, p in ausentes if p.get("_id_firstname"))
+        print(f"  → {len(ausentes)} contactos de Circle/Brevo que NO están en HubSpot quedaron "
+              f"en {csv_nuevos} ({con_nombre} con nombre). NO se crearon.", file=sys.stderr)
+
+    # Payload final: marketing siempre; identidad sólo donde HubSpot está vacío.
+    #
+    # Se agrupa POR ID, no por email. Dos direcciones de Brevo pueden resolver al MISMO
+    # contacto de HubSpot (un alias y su primaria son dos contactos en Brevo, que rastrea
+    # por dirección, y uno solo en HubSpot, que las fusiona). Sin agrupar, el mismo id
+    # entra dos veces en el mismo lote de `batch/update` y la segunda entrada pisa a la
+    # primera — con el upsert viejo pasaba lo mismo del lado del servidor, en silencio.
+    por_id, completados = {}, collections.Counter()
+    for e, p in presentes:
+        info = existentes[e]
+        props = {k: v for k, v in p.items() if k not in INTERNAS and v is not None}
+        for clave, destino in DESTINO_IDENTIDAD.items():
+            valor = p.get(clave)
+            if valor and destino in info["vacios"]:
+                props[destino] = valor
+        if not props:
+            continue
+        if info["id"] in por_id:
+            # Se combinan las dos direcciones. Lo que ya estaba gana, así se puede
+            # explicar el resultado: manda la primera dirección que apareció.
+            fusion = por_id[info["id"]]
+            fusion["props"] = {**props, **fusion["props"]}
+            fusion["emails"].append(e)
+        else:
+            por_id[info["id"]] = {"props": props, "emails": [e]}
+    for v in por_id.values():
+        for destino in DESTINO_IDENTIDAD.values():
+            if destino in v["props"]:
+                completados[destino] += 1
+    lote_final = [(oid, v["props"]) for oid, v in por_id.items()]
+
+    colisiones = [v["emails"] for v in por_id.values() if len(v["emails"]) > 1]
+    if colisiones:
+        print(f"  {len(colisiones)} contactos alcanzados por MÁS DE UNA dirección de "
+              f"Brevo (alias): se escribe una vez por contacto. Ej: {colisiones[:3]}",
+              file=sys.stderr)
+
+    print(f"A escribir: {len(lote_final)} contactos", file=sys.stderr)
+    if completados:
+        print("  identidad a completar (sólo campos vacíos): "
+              + " · ".join(f"{k}={n}" for k, n in completados.most_common()),
+              file=sys.stderr)
+    if crear_nuevos and ausentes:
+        print("  ⚠ --crear-nuevos NO está implementado como upsert a proposito: si "
+              "hace falta crear, se hace por el backfill de hubspot_admin, que aplica "
+              "el umbral de evidencia y deja backup.", file=sys.stderr)
     if dry_run:
-        for email, props in items[:10]:
-            print(f"  [dry-run] {email}: {props}")
-        print(f"  [dry-run] ... y {max(0, len(items)-10)} mas")
-        return {"escritos": 0, "dry_run": len(items)}
+        for oid, props in lote_final[:10]:
+            print(f"  [dry-run] {oid}: {props}")
+        print(f"  [dry-run] ... y {max(0, len(lote_final)-10)} mas")
+        return {"escritos": 0, "dry_run": len(lote_final),
+                "no_creados": len(ausentes), "identidad": dict(completados)}
 
     escritos = fallidos = 0
-    rechazados = []
-    for i in range(0, len(items), 100):
-        e, f, desc = _postear_lote(items[i:i+100])
+    for i in range(0, len(lote_final), 100):
+        e, f, _ = _postear_lote(lote_final[i:i+100])
         escritos += e
         fallidos += f
-        rechazados += desc
         time.sleep(0.2)
     print(f"  escritos={escritos} fallidos={fallidos}", file=sys.stderr)
-    if rechazados:
-        print(f"  emails rechazados por HubSpot ({len(rechazados)}): "
-              f"{rechazados[:10]}{' ...' if len(rechazados) > 10 else ''}", file=sys.stderr)
-    # `rechazados` = emails que HubSpot nombro como invalidos en el cuerpo del 400.
-    # `inexplicados` = fallidos que nadie explico: lote caido por token vencido, rate
-    # limit agotado, 500. Esa es la unica cifra que debe tumbar la corrida (ver main).
-    inexplicados = max(0, fallidos - len(rechazados))
-    if inexplicados:
-        print(f"  ⚠ {inexplicados} fallidos SIN explicacion de HubSpot", file=sys.stderr)
+    # `inexplicados`: fallidos que nadie explico (token vencido, rate limit, 500). Con
+    # update por id ya no hay rechazos por email invalido, asi que todo fallo es real
+    # y esa es la unica cifra que debe tumbar la corrida (ver main).
+    if fallidos:
+        print(f"  ⚠ {fallidos} fallidos SIN explicacion de HubSpot", file=sys.stderr)
     return {"escritos": escritos, "fallidos": fallidos,
-            "inexplicados": inexplicados,
-            "rechazados_hubspot": rechazados,
-            "rechazados": rechazados + descartados_regex}
+            "inexplicados": fallidos,
+            "no_creados": len(ausentes),
+            "identidad": dict(completados),
+            "rechazados_hubspot": [],
+            "rechazados": descartados_regex}
 
 
 def main():
@@ -825,6 +1070,8 @@ def main():
     ap.add_argument("--solo", choices=["circle", "brevo"])
     ap.add_argument("--limite", type=int, help="tope de contactos a escribir")
     ap.add_argument("--generar-mapeo", action="store_true")
+    ap.add_argument("--crear-nuevos", action="store_true",
+                    help="NO recomendado: este sync no crea contactos (ver escribir())")
     a = ap.parse_args()
 
     # Antes de gastar 20 minutos de llamadas: si falta un token, fallar acá.

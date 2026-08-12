@@ -17,3 +17,5 @@ venv/
 # macOS / Windows
 .DS_Store
 desktop.ini
+# Salida de revision del sync
+contactos_sin_crear.csv
