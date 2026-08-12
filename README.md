@@ -9,7 +9,7 @@ Corre solo en **GitHub Actions**. No depende de que ninguna laptop esté prendid
 |---|---|
 | **Qué escribe** | 25 propiedades de Contacto en HubSpot (`circle_*` y `brevo_*`), más `firstname`/`lastname`/`jobtitle`/`country` **sólo donde están vacías** |
 | **Qué NO hace** | **crear contactos.** Actualiza los que existen, por `hs_object_id`. Ver §Este sync no crea contactos |
-| **Circle** | **todos los días**, 10:17 UTC (≈ 06:17 Chile) · `.github/workflows/sync-diario.yml` · ~40 s |
+| **Circle** | **todos los días a las 07:07 de Chile** · `.github/workflows/sync-diario.yml` · ~40 s. Son **dos** entradas de cron (11:07 UTC de abr-ago, 10:07 UTC de sep-mar) porque GitHub sólo entiende UTC y Chile cambia de hora. |
 | **Brevo** | **miércoles** 11:23 UTC (≈ 07:23 Chile) · `.github/workflows/sync-semanal.yml` · 20-25 min. El newsletter sale los **martes**: lo recoge ~24 h después del envío. |
 | **Portal HubSpot** | 51404466 (producción) |
 
@@ -179,7 +179,7 @@ el único mecanismo capaz de detectar que el cron dejó de disparar.
 ⚠️ Al rotar un token, actualizar el secret **en la misma tanda**. Orden correcto:
 rotar → `gh secret set` → `gh workflow run sync-diario.yml` para verificar en vivo →
 recién ahí revocar el viejo. Si se rota sin actualizar el secret, el job muere mañana a
-las 06:17 y el aviso va a un mail que nadie mira.
+las 07:07 y el aviso va a un mail que nadie mira.
 
 En local salen de un `.env` junto al script (está en `.gitignore`). `load_env()` usa
 `setdefault`, así que **una variable ya presente en el entorno gana sobre el archivo**: en
@@ -300,11 +300,17 @@ hacen falta las dos cosas.
 
 | Cron nominal | Disparó | Atraso |
 |---|---|---|
-| lun 11:00 UTC (2026-08-03) | 17:28 UTC | **6 h 28 min** |
-| lun 11:00 UTC (2026-08-10) | 14:40 UTC | **3 h 40 min** |
+| `0 11` — lun 2026-08-03 | 17:28 UTC | **6 h 28 min** |
+| `0 11` — lun 2026-08-10 | 14:40 UTC | **3 h 40 min** |
+| `17 10` — mié 2026-08-12 | 11:09 UTC | **52 min** |
+| `23 11` — mié 2026-08-12 | 12:03 UTC | **40 min** |
 
-El minuto 0 de una hora en punto es el slot más congestionado del scheduler compartido.
-Los tres workflows de acá usan minutos impares (17, 23, 41) para bajar la cola, pero eso
-**no la elimina**: no construyas nada que dependa de la hora exacta, y dale al
-dead-man's switch una holgura de horas, no de minutos. El 2026-08-10 alguien revisó a las
-14:05, no vio la corrida y la dio por no ejecutada; había disparado 35 minutos después.
+El minuto 0 de una hora en punto es el slot más congestionado del scheduler compartido, y
+la tercera y cuarta fila son la evidencia de que moverse de ahí sirve: de horas a menos de
+una. Los workflows de acá usan minutos impares (07, 23, 41) por eso.
+
+Pero **no lo elimina**, y el atraso siempre empuja hacia adelante: "07:07 de Chile"
+significa en la práctica *temprano en la mañana*, no las 07:07. No construyas nada que
+dependa de la hora exacta, y dale al dead-man's switch una holgura de horas, no de
+minutos. El 2026-08-10 alguien revisó a las 14:05, no vio la corrida y la dio por no
+ejecutada; había disparado 35 minutos después.

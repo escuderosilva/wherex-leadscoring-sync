@@ -15,15 +15,34 @@ name: Sync diario Circle → HubSpot
 
 on:
   schedule:
-    # 10:17 UTC ≈ 06:17 en Chile (UTC-4).
+    # Objetivo: 07:07 en Chile, todos los días del año.
     #
-    # El minuto 17 no es capricho. Las dos únicas corridas programadas con `0 11`
-    # dispararon 6 h 28 min tarde (2026-08-03, a las 17:28 UTC) y 3 h 40 min tarde
-    # (2026-08-10, a las 14:40 UTC). El minuto 0 de una hora en punto es el slot más
-    # congestionado del scheduler compartido de GitHub. Un minuto impar reduce la
-    # cola, pero NO la elimina: no hay que construir nada que dependa de la hora
-    # exacta. Para eso está el dead-man's switch, con holgura de horas.
-    - cron: '17 10 * * *'
+    # GitHub sólo entiende UTC y Chile cambia de hora, así que hacen falta DOS
+    # entradas. Chile pasa a horario de verano el primer sábado de SEPTIEMBRE (UTC-3)
+    # y vuelve el primer sábado de ABRIL (UTC-4). Los rangos de mes son disjuntos, así
+    # que cada día dispara exactamente una:
+    #
+    #   abr-ago  → Chile en UTC-4 → 11:07 UTC = 07:07 Chile
+    #   sep-mar  → Chile en UTC-3 → 10:07 UTC = 07:07 Chile
+    #
+    # El cron no tiene día-de-la-semana-del-mes, así que el corte es por mes y queda
+    # con holgura: los primeros días de septiembre (aún UTC-4) la corrida cae 06:07, y
+    # los primeros días de abril (aún UTC-3) cae 08:07. Una semana desalineada dos
+    # veces al año, sobre un sync idempotente que además se repara solo al día
+    # siguiente. No vale la pena más precisión que ésa.
+    #
+    # Por qué minuto 07 y no 00: las dos únicas corridas programadas con `0 11`
+    # dispararon 6 h 28 min tarde (2026-08-03 → 17:28 UTC) y 3 h 40 min tarde
+    # (2026-08-10 → 14:40 UTC). El minuto 0 de una hora en punto es el slot más
+    # congestionado del scheduler compartido de GitHub; con el minuto 17 el atraso del
+    # 2026-08-12 fue de 52 min. O sea: el minuto impar ayuda mucho pero NO garantiza
+    # nada, y el atraso siempre empuja hacia adelante, nunca hacia atrás.
+    #
+    # ⚠️ En la práctica esto significa "temprano en la mañana", no "a las 07:07". Si
+    # algo necesita el dato a una hora exacta, esto no es el mecanismo. Para saber si
+    # corrió está el dead-man's switch, con holgura de horas justamente por esto.
+    - cron: '7 11 * 4-8 *'
+    - cron: '7 10 * 9-12,1-3 *'
   workflow_dispatch:
     inputs:
       dry_run:
