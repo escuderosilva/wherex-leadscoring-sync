@@ -309,8 +309,19 @@ El minuto 0 de una hora en punto es el slot más congestionado del scheduler com
 la tercera y cuarta fila son la evidencia de que moverse de ahí sirve: de horas a menos de
 una. Los workflows de acá usan minutos impares (07, 23, 41) por eso.
 
-Pero **no lo elimina**, y el atraso siempre empuja hacia adelante: "07:07 de Chile"
-significa en la práctica *temprano en la mañana*, no las 07:07. No construyas nada que
-dependa de la hora exacta, y dale al dead-man's switch una holgura de horas, no de
-minutos. El 2026-08-10 alguien revisó a las 14:05, no vio la corrida y la dio por no
-ejecutada; había disparado 35 minutos después.
+**Cinco días seguidos del diario con `7 11` (nominal 07:07 de Chile), medidos:**
+
+| Día | Disparó (Chile) | Atraso |
+|---|---|---|
+| mié 13-ago | 07:55 | +49 min |
+| jue 14-ago | 07:52 | +46 min |
+| vie 15-ago | 07:30 | +24 min |
+| sáb 16-ago | 07:30 | +23 min |
+| dom 17-ago | 07:35 | +28 min |
+
+Las cinco verdes, todas dentro de la primera hora, ninguna antes de la hora nominal. O
+sea: **el atraso es la norma, no la excepción, y siempre empuja hacia adelante.** "07:07
+de Chile" significa en la práctica *entre 07:07 y 08:00*. No construyas nada que dependa
+de la hora exacta, y dale al dead-man's switch una holgura de horas, no de minutos. El
+2026-08-10 alguien revisó a las 14:05, no vio la corrida y la dio por no ejecutada; había
+disparado 35 minutos después.
