@@ -863,6 +863,125 @@ MAX_CREAR_CIRCLE = 60                      # más que esto en una corrida = algo
 DOMINIOS_INTERNOS = ("@wherex.com", "@procure.lat")
 ROLES_COMPRADOR = ("Comprador", "Lidero el área")
 
+# --------------------------------------------------------- combinar direcciones
+# Cuando dos direcciones de Brevo resuelven al MISMO contacto de HubSpot (196 casos
+# medidos el 2026-08-17), hay que combinar sus payloads. La regla NO puede ser una sola
+# para todas las propiedades: depende de qué significa cada una.
+#
+# La primera versión de la agrupación hacía first-write-wins por clave (`{**props,
+# **fusion["props"]}`), o sea que ganaba la dirección que apareció primero. Eso subcuenta
+# interacción, congela fechas viejas y —lo importante— puede perder una baja.
+#
+# Ojo, el `batch/upsert` viejo hacía exactamente lo mismo del lado del servidor y en
+# silencio. Esto no es un bug nuevo: es uno viejo que la agrupación volvió visible.
+SUMAR = {"brevo_enviados", "brevo_aperturas", "brevo_clics", "brevo_clics_comerciales",
+         "brevo_nl_aperturas_90d", "academico_registros_12m", "academico_asistencias_12m",
+         "academico_asistencias_pagas_12m", "academico_certificados",
+         "eventos_pl_asistencias_12m", "eventos_wherex_12m",
+         "circle_publicaciones", "circle_comentarios", "circle_posts_contenido"}
+MAXIMO = {"brevo_ultima_apertura", "brevo_ultimo_clic", "brevo_fecha_desuscripcion",
+          "academico_ultima_actividad", "circle_ultima_visita", "circle_fecha_presentacion",
+          "circle_fecha_ultimo_contenido", "circle_perfil_confirmado",
+          "circle_nivel", "circle_puntos", "circle_activity_score", "circle_presence",
+          "circle_participacion", "circle_contribucion"}
+MINIMO = {"circle_miembro_desde"}          # la fecha de alta más antigua es la verdadera
+
+
+def _num(v):
+    try:
+        return float(str(v).replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+
+
+def combinar(a: dict, b: dict) -> dict:
+    """Combina los payloads de dos direcciones del mismo contacto, por tipo de propiedad.
+
+    - contadores  -> **suma** (una apertura desde la dirección secundaria es una apertura)
+    - fechas/máx  -> **máximo** ("última apertura" es un máximo, no el de la primera dirección)
+    - alta        -> **mínimo** (miembro desde la fecha más antigua)
+    - la baja     -> ver `_combinar_baja`, que NO es un OR ingenuo
+    - el resto    -> gana el valor ya presente, y se deja constancia si difieren
+    """
+    out = dict(a)
+    for k, v in b.items():
+        if v is None:
+            continue
+        if k not in out or out[k] is None:
+            out[k] = v
+            continue
+        if k in SUMAR:
+            na, nb = _num(out[k]), _num(v)
+            if na is not None and nb is not None:
+                out[k] = int(na + nb) if float(na + nb).is_integer() else na + nb
+        elif k in MAXIMO:
+            na, nb = _num(out[k]), _num(v)
+            if na is not None and nb is not None:
+                out[k] = out[k] if na >= nb else v
+            else:                              # fechas ISO: comparan bien como texto
+                out[k] = max(str(out[k]), str(v))
+        elif k in MINIMO:
+            out[k] = min(str(out[k]), str(v))
+    # `brevo_tasa_apertura` es una TASA: sumarla no significa nada. Se recalcula sobre
+    # los acumulados ya combinados, que es la única forma de que quede consistente.
+    env, ape = _num(out.get("brevo_enviados")), _num(out.get("brevo_aperturas"))
+    if env and ape is not None:
+        out["brevo_tasa_apertura"] = round(ape / env * 100, 1)
+    _combinar_baja(out, a, b)
+    return out
+
+
+def _combinar_baja(out: dict, a: dict, b: dict) -> None:
+    """La baja se combina por TIPO, no con un OR sobre `brevo_desuscrito`.
+
+    🔴 El OR ingenuo ("cualquier baja gana") es **peor que el bug que arregla**, y está
+    medido. De los 62 contactos con `brevo_desuscrito` discordante entre sus direcciones
+    (2026-08-17), los 31 en los que HubSpot dice `false` se reparten así:
+
+        rebote_duro   14   <- la dirección con typo no existe y rebotó
+        sin_rastro    16   <- limpieza administrativa nuestra (import, borrado a mano)
+        usuario        1   <- la única persona que de verdad pidió no recibir
+
+    Con un OR sobre `emailBlacklisted` se suprimirían **30 personas que nunca pidieron
+    nada**, la mayoría porque una dirección vieja o mal tipeada de las suyas rebotó. Eso
+    es peor que dejar pasar 1: el error cambia de dirección y afecta a 30 veces más gente.
+
+    `Scoring_MQL.md` ya fija el criterio para el puntaje —sólo la baja del **usuario**
+    cuenta; el rebote duro y la limpieza administrativa son ruido operativo— y acá se
+    aplica el mismo, que es lo coherente: **gana `usuario` si alguna dirección lo tiene.**
+    """
+    tipos = [d.get("brevo_desuscripcion_tipo") for d in (a, b)]
+    if "usuario" in tipos:
+        out["brevo_desuscrito"] = "true"
+        out["brevo_desuscripcion_tipo"] = "usuario"
+        fechas = [d.get("brevo_fecha_desuscripcion") for d in (a, b)
+                  if d.get("brevo_desuscripcion_tipo") == "usuario"
+                  and d.get("brevo_fecha_desuscripcion")]
+        if fechas:
+            out["brevo_fecha_desuscripcion"] = min(str(f) for f in fechas)
+        return
+    # Sin baja de usuario: no se suprime a nadie por un rebote de otra de sus
+    # direcciones. Queda el estado de la dirección PRIMARIA, que es la que HubSpot usa
+    # para enviar.
+    if out.get("brevo_desuscrito") is None:
+        for d in (a, b):
+            if d.get("brevo_desuscrito") is not None:
+                out["brevo_desuscrito"] = d["brevo_desuscrito"]
+                break
+    # Y el registro no puede contradecirse consigo mismo: un TIPO de baja junto a
+    # `brevo_desuscrito = false` es exactamente lo que produjo el first-write-wins —
+    # el tipo venía de una dirección y el booleano de la otra. Medido el 2026-08-17:
+    # **32 contactos** quedaron así (14 rebote_duro, 16 admin, 2 usuario).
+    #
+    # Importa porque alguien va a construir listas con esto: excluir por
+    # `brevo_desuscripcion_tipo = usuario` a secas saca de los envíos a personas que
+    # están suscritas. La exclusión correcta es DOBLE (`brevo_desuscrito = true` **y**
+    # `tipo = usuario`), y para que eso funcione el par tiene que ser coherente.
+    if out.get("brevo_desuscrito") == "false":
+        out.pop("brevo_desuscripcion_tipo", None)
+        out.pop("brevo_fecha_desuscripcion", None)
+
+
 # Piso de cordura del DESTINO (complemento de MIN_MIEMBROS_CIRCLE, que cuida el ORIGEN).
 #
 # `resolver()` es el unico lugar que sabe cuantos de los contactos leidos existen en
@@ -915,11 +1034,13 @@ def resolver(emails):
     con la que se preguntó.
     """
     campos = list(DESTINO_IDENTIDAD.values())
+    # `brevo_desuscripcion_tipo` NO es un campo de identidad: se lee sólo para poder
+    # detectar el ratchet (ver `escribir`), no para completarlo.
+    lectura = campos + ["email", "hs_additional_emails", "brevo_desuscripcion_tipo"]
     out = {}
     for i in range(0, len(emails), 100):
         lote = emails[i:i + 100]
-        body = {"idProperty": "email",
-                "properties": campos + ["email", "hs_additional_emails"],
+        body = {"idProperty": "email", "properties": lectura,
                 "inputs": [{"id": e} for e in lote]}
         for intento in range(6):
             try:
@@ -943,7 +1064,8 @@ def resolver(emails):
         for res in d.get("results", []):
             p = res.get("properties") or {}
             info = {"id": res["id"],
-                    "vacios": {c for c in campos if not (p.get(c) or "").strip()}}
+                    "vacios": {c for c in campos if not (p.get(c) or "").strip()},
+                    "tipo_baja": (p.get("brevo_desuscripcion_tipo") or "").strip()}
             # Todas las direcciones del contacto: la primaria y cada alias. El email de
             # entrada es una de ellas, y es la clave con la que el llamador va a buscar.
             direcciones = [p.get("email") or ""]
@@ -1202,13 +1324,34 @@ def escribir(por_email, dry_run=False, limite=None, crear_nuevos=False,
             valor = p.get(clave)
             if valor and destino in info["vacios"]:
                 props[destino] = valor
+        # 🔴 Ratchet del tipo de baja, arreglo ACOTADO a propósito.
+        #
+        # `brevo_desuscripcion_tipo` no se limpia nunca, porque el sync omite `None` por
+        # diseño y así una falla transitoria de la API no vacía datos buenos. Efecto: si
+        # la persona se vuelve a suscribir, el tipo queda pegado. Medido el 2026-08-17:
+        # 32 contactos con tipo sin baja vigente (14 rebote_duro, 16 admin, 2 usuario).
+        #
+        # El ratchet NO es simétrico, y por eso el arreglo tampoco: `rebote_duro` y
+        # `admin` pegados son inocuos —ninguna regla de exclusión los consulta y el
+        # booleano ya dice `false`—, mientras que `usuario` es el ÚNICO valor que una
+        # regla de consentimiento mira. Así que se limpia sólo ése, sólo cuando Brevo
+        # dice que hoy no hay baja. Son 2 registros, y con eso se cubre el 100% del
+        # riesgo real sin habilitar el vaciado general de la propiedad.
+        #
+        # Caso testigo: `bcarrasco@sande.cl` tenía `tipo = usuario` con fecha 2026-05-05
+        # y en Brevo no tiene ninguna baja; recibió 22 envíos y abrió uno el 2026-08-04,
+        # o sea 13 días DESPUÉS de la fecha en que supuestamente pidió no recibir nada.
+        if (info.get("tipo_baja") == "usuario"
+                and props.get("brevo_desuscrito") == "false"
+                and "brevo_desuscripcion_tipo" not in props):
+            props["brevo_desuscripcion_tipo"] = ""     # "" BORRA la propiedad en HubSpot
         if not props:
             continue
         if info["id"] in por_id:
-            # Se combinan las dos direcciones. Lo que ya estaba gana, así se puede
-            # explicar el resultado: manda la primera dirección que apareció.
+            # Se combinan las dos direcciones POR TIPO de propiedad (ver `combinar`):
+            # suma para contadores, máximo para fechas, y la baja sólo si es del usuario.
             fusion = por_id[info["id"]]
-            fusion["props"] = {**props, **fusion["props"]}
+            fusion["props"] = combinar(fusion["props"], props)
             fusion["emails"].append(e)
         else:
             por_id[info["id"]] = {"props": props, "emails": [e]}
