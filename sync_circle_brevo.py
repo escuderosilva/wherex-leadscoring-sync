@@ -54,8 +54,8 @@ existencia primero y los ausentes quedan en un CSV de revision. Ver `escribir()`
 **Excepción acotada (2026-10-21): los miembros de Circle sí se crean.** Son personas
 que se registraron en procure.lat con nombre, empresa y cargo, y sin contacto no se
 les puede atribuir el alta a su SDR/AE. Se crean sólo con nombre y apellido, fuera de
-los dominios internos, si no hay ya un contacto con el mismo nombre (posible
-duplicado) y hasta `MAX_CREAR_CIRCLE` por corrida. Brevo sigue sin crear nada. Ver
+los dominios internos, si no hay ya un contacto que parezca la misma persona (mismo
+nombre y misma empresa o dominio) y hasta `MAX_CREAR_CIRCLE` por corrida. Brevo sigue sin crear nada. Ver
 `crear_miembros_circle()`. Desde la misma fecha, Circle se lee con `status=all`:
 entran también los invitados que no completaron el perfil.
 """
@@ -69,6 +69,7 @@ import re
 import sys
 import threading
 import time
+import unicodedata
 import urllib.parse
 import warnings
 from collections import defaultdict
@@ -966,14 +967,31 @@ def resolver(emails):
     return out
 
 
-def _ya_existe_por_nombre(nombre, apellido):
-    """id de un contacto con el mismo nombre y apellido, o None. Es el guardarraíl
-    contra duplicados: un miembro que se registró en Circle con otro correo (el
-    personal en vez del de la empresa) ya puede estar en HubSpot."""
+FREEMAIL = ("gmail.", "hotmail.", "outlook.", "yahoo.", "icloud.", "live.", "msn.")
+SIN_EMPRESA = {"", "particular", "independiente", "na", "privada", "personal", "propia", "ninguna"}
+
+
+def _norm(s):
+    s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z0-9]", "", s)
+
+
+def _duplicado(email, nombre, apellido, empresa):
+    """(id, motivo) si ya hay en HubSpot alguien que parece la MISMA persona; None si no.
+
+    El nombre solo no alcanza (2026-10-21): de 10 choques por nombre y apellido,
+    ninguno era la misma persona. Por ejemplo, Perla Torres de INGESSA no es Perla
+    Torres de Volkswagen. Se considera duplicado si, además del nombre, coincide:
+    - el dominio corporativo del correo, o
+    - la empresa (una contiene a la otra, sin tildes ni signos).
+    Si el miembro usó un correo personal y falta la empresa de un lado, no hay cómo
+    distinguir: se deja para revisar a mano (podría ser la misma persona con su
+    correo de trabajo en HubSpot).
+    """
     body = {"filterGroups": [{"filters": [
         {"propertyName": "firstname", "operator": "EQ", "value": nombre},
         {"propertyName": "lastname", "operator": "EQ", "value": apellido}]}],
-        "properties": ["email"], "limit": 1}
+        "properties": ["email", "company"], "limit": 5}
     for intento in range(5):
         r = requests.post(f"{HS}/crm/v3/objects/contacts/search", headers=_h_hs(),
                           json=body, timeout=30)
@@ -981,9 +999,23 @@ def _ya_existe_por_nombre(nombre, apellido):
             time.sleep(float(r.headers.get("Retry-After", 2 ** intento)))
             continue
         r.raise_for_status()
-        res = r.json().get("results", [])
-        return res[0]["id"] if res else None
-    raise RuntimeError("search de duplicados: agotados los reintentos")
+        break
+    else:
+        raise RuntimeError("search de duplicados: agotados los reintentos")
+    dominio = email.split("@")[-1].lower()
+    personal = dominio.startswith(FREEMAIL)
+    emp = "" if _norm(empresa) in SIN_EMPRESA else _norm(empresa)
+    for x in r.json().get("results", []):
+        p = x["properties"]
+        dom_hs = (p.get("email") or "@").split("@")[-1].lower()
+        emp_hs = "" if _norm(p.get("company")) in SIN_EMPRESA else _norm(p.get("company"))
+        if not personal and dom_hs == dominio:
+            return x["id"], "mismo nombre y dominio"
+        if emp and emp_hs and (emp in emp_hs or emp_hs in emp):
+            return x["id"], "mismo nombre y empresa"
+        if personal and not (emp and emp_hs):
+            return x["id"], "mismo nombre, correo personal y sin empresa para comparar"
+    return None
 
 
 def crear_miembros_circle(ausentes, dry_run=False):
@@ -1001,8 +1033,8 @@ def crear_miembros_circle(ausentes, dry_run=False):
     Guardarraíles:
     - sólo payloads de Circle (`es_comunidad`), nunca de Brevo;
     - con nombre y apellido, y fuera de los dominios internos;
-    - si ya hay un contacto con el mismo nombre y apellido, NO se crea (posible
-      duplicado con otro correo): queda en el CSV para revisar a mano;
+    - si ya hay alguien que parece la misma persona (nombre + empresa o dominio;
+      ver `_duplicado`), NO se crea: queda en el CSV para revisar a mano;
     - más de `MAX_CREAR_CIRCLE` candidatos en una corrida = no se crea ninguno;
     - nace con los obligatorios del modelo (crm/Contacto.md §4): `status_contacto`
       = nuevo y `area_negocio` = comprador si su rol en compras lo dice.
@@ -1024,10 +1056,10 @@ def crear_miembros_circle(ausentes, dry_run=False):
         return 0, saltados + [(e, "sobre el tope de creación") for e, _ in candidatos]
     nuevos = []
     for e, p in candidatos:
-        dup = _ya_existe_por_nombre(p["_c_firstname"], p["_c_lastname"])
+        dup = _duplicado(e, p["_c_firstname"], p["_c_lastname"], p.get("_c_company"))
         time.sleep(0.25)
         if dup:
-            saltados.append((e, f"posible duplicado del contacto {dup}"))
+            saltados.append((e, f"posible duplicado del contacto {dup[0]} ({dup[1]})"))
             continue
         props = {k: v for k, v in p.items() if k not in INTERNAS and v is not None}
         props.update({"email": e, "firstname": p["_c_firstname"], "lastname": p["_c_lastname"],
