@@ -50,6 +50,14 @@ contactos sin nombre (6.623 por el import del 21-jul y 2.964 por las corridas de
 29-30 de jul, estos ultimos etiquetados `INTEGRACION - Migracion API` porque este
 sync usa la misma app privada que el ETL de Salesforce). Ahora se resuelve la
 existencia primero y los ausentes quedan en un CSV de revision. Ver `escribir()`.
+
+**Excepción acotada (2026-10-21): los miembros de Circle sí se crean.** Son personas
+que se registraron en procure.lat con nombre, empresa y cargo, y sin contacto no se
+les puede atribuir el alta a su SDR/AE. Se crean sólo con nombre y apellido, fuera de
+los dominios internos, si no hay ya un contacto con el mismo nombre (posible
+duplicado) y hasta `MAX_CREAR_CIRCLE` por corrida. Brevo sigue sin crear nada. Ver
+`crear_miembros_circle()`. Desde la misma fecha, Circle se lee con `status=all`:
+entran también los invitados que no completaron el perfil.
 """
 import argparse
 import collections
@@ -215,12 +223,24 @@ def _dias(iso):
 
 
 # -------------------------------------------------------------------------- circle
+def _rol_compras(m):
+    rol = (m.get("flattened_profile_fields") or {}).get("rol_en_compras")
+    return ", ".join(rol) if isinstance(rol, list) else (rol or None)
+
+
 def circle_miembros():
-    """{email: props} con gamificacion, actividad y fechas de cada miembro."""
+    """{email: props} con gamificacion, actividad y fechas de cada miembro.
+
+    `status=all` (2026-10-21): sin él, Circle omite a los "invitados", es decir, a
+    quien se registró por el SSO de procure.lat pero no terminó el perfil. Eran 25
+    de las 661 altas de ago-oct que quedaban sin `es_comunidad`, y por lo tanto sin
+    atribución a SDR/AE. Se distinguen de los activos por `circle_perfil_confirmado`
+    vacío, que es la definición acordada de onboarding (2026-07-29).
+    """
     out, page = {}, 1
     while page <= 60:
         r = _get(f"{CIRCLE}/community_members", _h_circle(),
-                 {"per_page": 100, "page": page})
+                 {"per_page": 100, "page": page, "status": "all"})
         d = r.json()
         recs = d.get("records", [])
         if not recs:
@@ -244,6 +264,12 @@ def circle_miembros():
                 "circle_contribucion": a.get("contribution"),
                 "circle_publicaciones": m.get("posts_count"),
                 "circle_comentarios": m.get("comments_count"),
+                # Internas: sólo para crear al miembro si no existe en HubSpot.
+                "_c_firstname": (m.get("first_name") or "").strip() or None,
+                "_c_lastname": (m.get("last_name") or "").strip() or None,
+                "_c_jobtitle": (m.get("headline") or "").strip() or None,
+                "_c_company": ((m.get("flattened_profile_fields") or {}).get("empresa") or "").strip() or None,
+                "_c_rol": _rol_compras(m),
             }
         if not d.get("has_next_page"):
             break
@@ -826,7 +852,15 @@ def _postear_lote(lote, nivel=0, intento=0):
 DESTINO_IDENTIDAD = {"_id_firstname": "firstname", "_id_lastname": "lastname",
                      "_id_jobtitle": "jobtitle", "_id_country": "country"}
 # Claves internas que nunca se mandan a HubSpot como propiedad.
-INTERNAS = set(DESTINO_IDENTIDAD) | {"_brevo_company", "_brevo_banda"}
+INTERNAS = set(DESTINO_IDENTIDAD) | {"_brevo_company", "_brevo_banda",
+                                     "_c_firstname", "_c_lastname", "_c_jobtitle",
+                                     "_c_company", "_c_rol"}
+
+# Altas de Circle que no existen en HubSpot (2026-10-21): la ÚNICA rama que crea.
+# Ver `crear_miembros_circle`.
+MAX_CREAR_CIRCLE = 60                      # más que esto en una corrida = algo raro
+DOMINIOS_INTERNOS = ("@wherex.com", "@procure.lat")
+ROLES_COMPRADOR = ("Comprador", "Lidero el área")
 
 # Piso de cordura del DESTINO (complemento de MIN_MIEMBROS_CIRCLE, que cuida el ORIGEN).
 #
@@ -932,6 +966,126 @@ def resolver(emails):
     return out
 
 
+def _ya_existe_por_nombre(nombre, apellido):
+    """id de un contacto con el mismo nombre y apellido, o None. Es el guardarraíl
+    contra duplicados: un miembro que se registró en Circle con otro correo (el
+    personal en vez del de la empresa) ya puede estar en HubSpot."""
+    body = {"filterGroups": [{"filters": [
+        {"propertyName": "firstname", "operator": "EQ", "value": nombre},
+        {"propertyName": "lastname", "operator": "EQ", "value": apellido}]}],
+        "properties": ["email"], "limit": 1}
+    for intento in range(5):
+        r = requests.post(f"{HS}/crm/v3/objects/contacts/search", headers=_h_hs(),
+                          json=body, timeout=30)
+        if r.status_code == 429:
+            time.sleep(float(r.headers.get("Retry-After", 2 ** intento)))
+            continue
+        r.raise_for_status()
+        res = r.json().get("results", [])
+        return res[0]["id"] if res else None
+    raise RuntimeError("search de duplicados: agotados los reintentos")
+
+
+def crear_miembros_circle(ausentes, dry_run=False):
+    """Crea en HubSpot a los miembros de Circle que no existen. Devuelve
+    (creados, [(email, motivo) de los que no se crearon]).
+
+    🔴 Es la ÚNICA excepción a "este sync no crea contactos" (2026-08-11), y es
+    acotada a propósito. Esa regla nació porque el upsert por email creaba un
+    contacto por cada suscriptor de Brevo, sin nombre ni empresa (9.587). Un miembro
+    de Circle es otra cosa: se registró en procure.lat con nombre, apellido,
+    empresa y cargo, y es exactamente la persona que el CRM tiene que tener. Medido
+    el 2026-10-21: 28 de las 661 altas de ago-oct no existían en HubSpot, y por eso
+    no podían recibir la atribución a su SDR/AE.
+
+    Guardarraíles:
+    - sólo payloads de Circle (`es_comunidad`), nunca de Brevo;
+    - con nombre y apellido, y fuera de los dominios internos;
+    - si ya hay un contacto con el mismo nombre y apellido, NO se crea (posible
+      duplicado con otro correo): queda en el CSV para revisar a mano;
+    - más de `MAX_CREAR_CIRCLE` candidatos en una corrida = no se crea ninguno;
+    - nace con los obligatorios del modelo (crm/Contacto.md §4): `status_contacto`
+      = nuevo y `area_negocio` = comprador si su rol en compras lo dice.
+    """
+    candidatos, saltados = [], []
+    for e, p in ausentes:
+        if p.get("es_comunidad") != "true":
+            continue
+        if e.endswith(DOMINIOS_INTERNOS):
+            saltados.append((e, "dominio interno"))
+        elif not (p.get("_c_firstname") and p.get("_c_lastname")):
+            saltados.append((e, "sin nombre y apellido en Circle"))
+        else:
+            candidatos.append((e, p))
+    if len(candidatos) > MAX_CREAR_CIRCLE:
+        print(f"  ⚠ {len(candidatos)} miembros de Circle por crear superan el tope "
+              f"{MAX_CREAR_CIRCLE}: no se crea ninguno. Revisar antes de subir el tope.",
+              file=sys.stderr)
+        return 0, saltados + [(e, "sobre el tope de creación") for e, _ in candidatos]
+    nuevos = []
+    for e, p in candidatos:
+        dup = _ya_existe_por_nombre(p["_c_firstname"], p["_c_lastname"])
+        time.sleep(0.25)
+        if dup:
+            saltados.append((e, f"posible duplicado del contacto {dup}"))
+            continue
+        props = {k: v for k, v in p.items() if k not in INTERNAS and v is not None}
+        props.update({"email": e, "firstname": p["_c_firstname"], "lastname": p["_c_lastname"],
+                      "status_contacto": "nuevo"})
+        if p.get("_c_jobtitle"):
+            props["jobtitle"] = p["_c_jobtitle"]
+        if p.get("_c_company"):
+            props["company"] = p["_c_company"]
+        if any(r in (p.get("_c_rol") or "") for r in ROLES_COMPRADOR):
+            props["area_negocio"] = "comprador"
+        nuevos.append(props)
+    print(f"  miembros de Circle a crear en HubSpot: {len(nuevos)} · no se crean: "
+          f"{len(saltados)}", file=sys.stderr)
+    if dry_run or not nuevos:
+        for x in nuevos[:5]:
+            print(f"  [dry-run] crearía {x['email'].split('@')[1]} · "
+                  f"{sorted(k for k in x if not k.startswith('circle_'))}", file=sys.stderr)
+        return 0, saltados
+    creados = 0
+    for i in range(0, len(nuevos), 100):
+        c, fallos = _crear_lote(nuevos[i:i + 100])
+        creados += c
+        saltados += fallos
+    print(f"  creados: {creados}", file=sys.stderr)
+    return creados, saltados
+
+
+def _crear_lote(lote, intento=0):
+    """(creados, [(email, motivo)]). Un solo correo que HubSpot no acepta
+    (`@hotmail.ocm`, medido el 2026-10-21) tumba el lote ENTERO con 400: es la misma
+    lección que `_postear_lote`. Se saca al culpable que nombra el error y se
+    reintenta; si el 400 no nombra a nadie, se crea de a uno."""
+    if not lote:
+        return 0, []
+    body = {"inputs": [{"properties": {k: str(v) for k, v in x.items()}} for x in lote]}
+    r = requests.post(f"{HS}/crm/v3/objects/contacts/batch/create", headers=_h_hs(),
+                      json=body, timeout=60)
+    if r.ok:
+        return len(r.json().get("results", [])), []
+    if r.status_code in (429, 500, 502, 503, 504) and intento < 5:
+        time.sleep(float(r.headers.get("Retry-After", min(2 ** intento, 30))))
+        return _crear_lote(lote, intento + 1)
+    if r.status_code == 400:
+        malos = {m.lower() for m in RE_INVALIDO.findall(r.text)}
+        if malos:
+            resto = [x for x in lote if x["email"].lower() not in malos]
+            c, f = _crear_lote(resto)
+            return c, f + [(m, "correo inválido según HubSpot") for m in sorted(malos)]
+        if len(lote) > 1:
+            c = 0; f = []
+            for x in lote:
+                c1, f1 = _crear_lote([x])
+                c += c1; f += f1
+            return c, f
+    print(f"  batch/create {r.status_code}: {r.text[:200]}", file=sys.stderr)
+    return 0, [(x["email"], f"HubSpot rechazó la creación ({r.status_code})") for x in lote]
+
+
 def escribir(por_email, dry_run=False, limite=None, crear_nuevos=False,
              csv_nuevos="contactos_sin_crear.csv"):
     """Actualiza contactos EXISTENTES por id, en lotes de 100. Nunca crea.
@@ -977,19 +1131,29 @@ def escribir(por_email, dry_run=False, limite=None, crear_nuevos=False,
     print(f"  existen en HubSpot: {len(presentes)} · NO existen: {len(ausentes)}",
           file=sys.stderr)
 
+    creados_circle, no_creados_circle = crear_miembros_circle(ausentes, dry_run=dry_run)
+    motivo_no_creado = dict(no_creados_circle)
+    if creados_circle:
+        # Los recién creados ya llevan su payload completo en el create.
+        creados_set = {e for e, p in ausentes if p.get("es_comunidad") == "true"
+                       and e not in motivo_no_creado}
+        ausentes = [(e, p) for e, p in ausentes if e not in creados_set]
+
     if ausentes:
         with open(csv_nuevos, "w", newline="", encoding="utf-8") as fh:
             w = csv.writer(fh)
             w.writerow(["email", "firstname", "lastname", "jobtitle", "country",
-                        "company_brevo", "banda_nombre", "desuscrito"])
+                        "company_brevo", "banda_nombre", "desuscrito", "motivo_no_creado"])
             for e, p in ausentes:
-                w.writerow([e, p.get("_id_firstname") or "", p.get("_id_lastname") or "",
-                            p.get("_id_jobtitle") or "", p.get("_id_country") or "",
-                            p.get("_brevo_company") or "", p.get("_brevo_banda") or "",
-                            p.get("brevo_desuscrito") or ""])
-        con_nombre = sum(1 for _, p in ausentes if p.get("_id_firstname"))
+                w.writerow([e, p.get("_id_firstname") or p.get("_c_firstname") or "",
+                            p.get("_id_lastname") or p.get("_c_lastname") or "",
+                            p.get("_id_jobtitle") or p.get("_c_jobtitle") or "", p.get("_id_country") or "",
+                            p.get("_brevo_company") or p.get("_c_company") or "", p.get("_brevo_banda") or "",
+                            p.get("brevo_desuscrito") or "", motivo_no_creado.get(e, "")])
+        con_nombre = sum(1 for _, p in ausentes if p.get("_id_firstname") or p.get("_c_firstname"))
         print(f"  → {len(ausentes)} contactos de Circle/Brevo que NO están en HubSpot quedaron "
-              f"en {csv_nuevos} ({con_nombre} con nombre). NO se crearon.", file=sys.stderr)
+              f"en {csv_nuevos} ({con_nombre} con nombre; el motivo de cada uno, en la "
+              f"columna motivo_no_creado). NO se crearon.", file=sys.stderr)
 
     # Payload final: marketing siempre; identidad sólo donde HubSpot está vacío.
     #
